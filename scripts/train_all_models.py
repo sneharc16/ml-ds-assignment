@@ -32,7 +32,9 @@ def main() -> None:
         from driveintent.models.recommender import RecommenderBundle
         cars = pd.read_parquet(cfg.raw_data / "cars.parquet")
         events = pd.read_parquet(cfg.raw_data / "events.parquet")
-        RecommenderBundle(cfg).fit(cars, events).save()
+        train_end = pd.Timestamp(cfg.get("splits", "train_end")) + pd.Timedelta(days=1)
+        events_train = events[pd.to_datetime(events["event_timestamp"]) < train_end]
+        RecommenderBundle(cfg).fit(cars, events_train).save()
         logging.info("recommender bundle saved")
     if "ranker" in todo:
         from driveintent.models import ranking
