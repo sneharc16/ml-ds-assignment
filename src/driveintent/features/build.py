@@ -9,6 +9,7 @@ Temporal hygiene rules:
 """
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 
 from driveintent.config import Config
@@ -44,7 +45,61 @@ def car_base_features(cars: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def attach_market_context(rows: pd.DataFrame, cars: pd.DataFrame,
+                          events: pd.DataFrame, observation_col: str) -> pd.DataFrame:
+    """Attach demand and live-supply features known at each row's observation time."""
+    out = rows.copy()
+    observed = pd.to_datetime(out[observation_col]).to_numpy(dtype="datetime64[ns]")
+    car_segments = cars[["car_id", "city", "body_type"]]
+    views = (events.loc[events["event_name"] == "view_item", ["car_id", "event_timestamp"]]
+             .dropna(subset=["car_id"])
+             .merge(car_segments, on="car_id", how="inner"))
+    views["event_timestamp"] = pd.to_datetime(views["event_timestamp"])
+    global_view_times = np.sort(views["event_timestamp"].to_numpy(dtype="datetime64[ns]"))
+    segment_count = max(len(cars[["city", "body_type"]].drop_duplicates()), 1)
+    total_views = np.searchsorted(global_view_times, observed, side="right")
+
+    demand_count = np.zeros(len(out), dtype=float)
+    for key, idx in out.groupby(["city", "body_type"]).groups.items():
+        times = np.sort(views.loc[
+            (views["city"] == key[0]) & (views["body_type"] == key[1]),
+            "event_timestamp",
+        ].to_numpy(dtype="datetime64[ns]"))
+        demand_count[np.asarray(list(idx))] = np.searchsorted(times, observed[list(idx)], side="right")
+    average_demand = total_views / segment_count
+    out["market_demand_index"] = np.divide(
+        demand_count, average_demand, out=np.full(len(out), 0.5), where=average_demand > 0
+    )
+
+    inventory = cars[["city", "body_type", "inventory_entry_date", "inventory_exit_date"]].copy()
+    inventory["inventory_entry_date"] = pd.to_datetime(inventory["inventory_entry_date"])
+    inventory["inventory_exit_date"] = pd.to_datetime(inventory["inventory_exit_date"])
+
+    def live_count(frame: pd.DataFrame, times: np.ndarray) -> np.ndarray:
+        entries = np.sort(frame["inventory_entry_date"].to_numpy(dtype="datetime64[ns]"))
+        exits = np.sort(frame["inventory_exit_date"].dropna().to_numpy(dtype="datetime64[ns]"))
+        return (np.searchsorted(entries, times, side="right")
+                - np.searchsorted(exits, times, side="left"))
+
+    city_supply = np.zeros(len(out), dtype=float)
+    for city, idx in out.groupby("city").groups.items():
+        city_supply[np.asarray(list(idx))] = live_count(
+            inventory[inventory["city"] == city], observed[list(idx)]
+        )
+    segment_supply = np.zeros(len(out), dtype=float)
+    for key, idx in out.groupby(["city", "body_type"]).groups.items():
+        segment_supply[np.asarray(list(idx))] = live_count(
+            inventory[(inventory["city"] == key[0]) & (inventory["body_type"] == key[1])],
+            observed[list(idx)],
+        )
+    out["local_supply_index"] = np.divide(
+        segment_supply, city_supply, out=np.zeros(len(out)), where=city_supply > 0
+    )
+    return out
+
+
 def attach_demand_index(cars_f: pd.DataFrame, events: pd.DataFrame) -> pd.DataFrame:
+    """Compatibility helper for ranking code; Phase 3 replaces its global profile."""
     ev = events[events["event_name"] == "view_item"].dropna(subset=["car_id"])
     ev = ev.merge(cars_f[["car_id", "body_type"]], on="car_id", how="left")
     dem = ev.groupby(["city", "body_type"]).size().rename("demand_events").reset_index()
@@ -57,10 +112,12 @@ def attach_demand_index(cars_f: pd.DataFrame, events: pd.DataFrame) -> pd.DataFr
 
 # --------------------------------------------------------------------------
 def build_price_dataset(cars: pd.DataFrame, events: pd.DataFrame) -> pd.DataFrame:
-    f = attach_demand_index(car_base_features(cars), events)
+    f = car_base_features(cars)
+    f["observation_date"] = pd.to_datetime(f["inventory_entry_date"])
+    f = f.drop(columns=["local_supply_index"])
+    f = attach_market_context(f, cars, events, "observation_date")
     ds = f[f["sold_flag"]].copy()
     ds["target_price"] = ds["transaction_price"]
-    ds["observation_date"] = pd.to_datetime(ds["inventory_exit_date"])
     return ds[["car_id", "observation_date", "target_price", "listed_price"] + PRICE_FEATURES]
 
 
@@ -68,7 +125,7 @@ def build_price_dataset(cars: pd.DataFrame, events: pd.DataFrame) -> pd.DataFram
 def build_booking_dataset(impressions: pd.DataFrame, sessions: pd.DataFrame,
                           users: pd.DataFrame, cars: pd.DataFrame,
                           events: pd.DataFrame) -> pd.DataFrame:
-    cars_f = attach_demand_index(car_base_features(cars), events)
+    cars_f = car_base_features(cars).drop(columns=["local_supply_index"])
     imp = impressions.merge(sessions, on=["session_id", "user_id"], how="left",
                             suffixes=("", "_s"))
     imp = imp.merge(users, on="user_id", how="left")
@@ -76,26 +133,32 @@ def build_booking_dataset(impressions: pd.DataFrame, sessions: pd.DataFrame,
                                          "inventory_exit_date", "days_in_inventory",
                                          "acquisition_price"]),
                     on="car_id", how="left", suffixes=("", "_car"))
+    imp["observation_date"] = pd.to_datetime(imp["event_timestamp"])
+    imp = attach_market_context(imp, cars, events, "observation_date")
 
     # user history strictly before this session (leak-free)
-    sess_book = (imp.groupby(["user_id", "session_sequence_number"])["booked"].max()
-                    .reset_index().sort_values(["user_id", "session_sequence_number"]))
+    sess_book = (imp.groupby(["user_id", "session_sequence_number", "session_start"])["booked"]
+                    .max().reset_index().sort_values(["user_id", "session_start"]))
     sess_book["prior_sessions"] = sess_book.groupby("user_id").cumcount()
-    sess_book["prior_bookings"] = (sess_book.groupby("user_id")["booked"]
-                                   .cumsum().shift(1).fillna(0))
-    sess_book.loc[sess_book["prior_sessions"] == 0, "prior_bookings"] = 0
+    sess_book["prior_bookings"] = sess_book.groupby("user_id")["booked"].transform(
+        lambda values: values.shift(fill_value=0).cumsum()
+    )
     imp = imp.merge(sess_book[["user_id", "session_sequence_number",
                                "prior_sessions", "prior_bookings"]],
                     on=["user_id", "session_sequence_number"], how="left")
     imp["prior_booking_rate"] = imp["prior_bookings"] / imp["prior_sessions"].clip(lower=1)
 
-    # session-level engagement counters (same-session, pre-outcome proxies)
-    sess_stats = (events.groupby("session_id")
+    # Session features stop at the impression decision time. Outcome/deep-
+    # engagement events later in the session must never enter model features.
+    decision_time = imp.groupby("session_id")["observation_date"].min().rename("decision_time")
+    predecision = events.merge(decision_time, on="session_id", how="inner")
+    predecision = predecision[pd.to_datetime(predecision["event_timestamp"]) <= predecision["decision_time"]]
+    sess_stats = (predecision.groupby("session_id")
                   .agg(session_searches=("event_name", lambda s: (s == "search").sum()),
                        session_filters=("event_name", lambda s: (s == "apply_filter").sum()),
                        session_events=("event_id", "count")).reset_index())
     imp = imp.merge(sess_stats, on="session_id", how="left")
-    imp["session_duration_s"] = (pd.to_datetime(imp["session_end"])
+    imp["session_duration_s"] = (pd.to_datetime(imp["observation_date"])
                                  - pd.to_datetime(imp["session_start"])).dt.total_seconds()
 
     # user-car match features
@@ -114,7 +177,6 @@ def build_booking_dataset(impressions: pd.DataFrame, sessions: pd.DataFrame,
                               + (imp["age_over_tolerance"] > 2).astype(int))
 
     imp["label_booked"] = imp["booked"].astype(int)
-    imp["observation_date"] = pd.to_datetime(imp["session_start"])
     return imp
 
 
@@ -143,7 +205,7 @@ BOOKING_FEATURES = [
 
 # --------------------------------------------------------------------------
 def build_sellthrough_dataset(cars: pd.DataFrame, events: pd.DataFrame) -> pd.DataFrame:
-    cars_f = attach_demand_index(car_base_features(cars), events)
+    cars_f = car_base_features(cars).drop(columns=["local_supply_index"])
     ev = events.dropna(subset=["car_id"]).copy()
     ev["event_timestamp"] = pd.to_datetime(ev["event_timestamp"])
 
@@ -160,6 +222,7 @@ def build_sellthrough_dataset(cars: pd.DataFrame, events: pd.DataFrame) -> pd.Da
                                   & (snap["days_in_inventory"] <= snap_age + 30)).astype(int)
         snapshots.append(snap)
     ds = pd.concat(snapshots, ignore_index=True)
+    ds = attach_market_context(ds, cars, events, "snapshot_date")
 
     # engagement counters strictly before snapshot_date
     counts = []
