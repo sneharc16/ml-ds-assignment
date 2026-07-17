@@ -1,0 +1,103 @@
+project:
+  name: DriveIntent
+  version: "1.0.0"
+  random_seed: 42
+
+paths:
+  raw_data: data/raw
+  interim_data: data/interim
+  processed_data: data/processed
+  database: data/database/driveintent.duckdb
+  artifacts: artifacts
+
+data_generation:
+  random_seed: 42
+  n_users: 8000
+  n_cars: 5000
+  n_sessions: 30000
+  target_events: 300000
+  n_campaigns: 15
+  start_date: "2024-01-01"
+  end_date: "2025-12-31"
+
+# Small profile for CI / tests / quick verification (scripts accept --small)
+test_data_generation:
+  random_seed: 42
+  n_users: 200
+  n_cars: 300
+  n_sessions: 500
+  target_events: 5000
+  n_campaigns: 5
+  start_date: "2024-06-01"
+  end_date: "2025-12-31"
+
+splits:
+  train_end: "2025-06-30"
+  validation_end: "2025-09-30"
+  test_end: "2025-12-31"
+
+position_bias:
+  # synthetic examination propensity by list position (1-indexed)
+  propensities: [0.95, 0.90, 0.84, 0.77, 0.70, 0.64, 0.58, 0.53, 0.48, 0.44,
+                 0.38, 0.34, 0.30, 0.27, 0.24, 0.22, 0.20, 0.18, 0.17, 0.16]
+
+recommendation:
+  candidate_limit: 150
+  final_limit: 10
+  session_half_life_minutes: 20
+  maximum_propensity_weight: 10.0
+  content_top_k: 50
+  collaborative_top_k: 50
+  session_top_k: 50
+  popularity_top_k: 30
+  inventory_top_k: 20
+
+reranking:
+  ranker_weight: 0.50
+  booking_weight: 0.18
+  deal_weight: 0.10
+  inventory_weight: 0.07
+  quality_weight: 0.08
+  diversity_weight: 0.07
+  constraint_penalty_weight: 0.30
+  exposure_penalty_weight: 0.05
+  minimum_relevance_for_inventory_boost: 0.60
+  mmr_lambda_low_entropy: 0.85
+  mmr_lambda_mid_entropy: 0.70
+  mmr_lambda_high_entropy: 0.55
+
+models:
+  price:
+    catboost:
+      iterations: 400
+      learning_rate: 0.08
+      depth: 7
+    quantiles: [0.1, 0.5, 0.9]
+    interval_coverage: 0.80
+  booking:
+    catboost:
+      iterations: 300
+      learning_rate: 0.08
+      depth: 6
+  sellthrough:
+    catboost:
+      iterations: 250
+      learning_rate: 0.08
+      depth: 6
+  collaborative:
+    factors: 32
+    regularization: 0.05
+    iterations: 15
+    alpha: 20.0
+  ranker:
+    iterations: 300
+    learning_rate: 0.08
+    depth: 6
+
+api:
+  host: 0.0.0.0
+  port: 8000
+
+dashboard:
+  host: 0.0.0.0
+  port: 8501

@@ -1,0 +1,19 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+ENV PYTHONUNBUFFERED=1 DRIVEINTENT_ROOT=/app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential libgomp1 && rm -rf /var/lib/apt/lists/*
+
+COPY pyproject.toml README.md ./
+COPY src ./src
+RUN pip install --no-cache-dir -e .
+
+COPY configs ./configs
+COPY sql ./sql
+COPY scripts ./scripts
+# data + artifacts are mounted at runtime via docker-compose volumes
+
+EXPOSE 8000
+CMD ["uvicorn", "driveintent.api.main:app", "--host", "0.0.0.0", "--port", "8000"]

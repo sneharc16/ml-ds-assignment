@@ -1,0 +1,27 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.env
+.ipynb_checkpoints/
+.pytest_cache/
+.ruff_cache/
+
+# generated data & artifacts (reproducible via `make pipeline`)
+data/raw/*.parquet
+data/processed/*.parquet
+data/database/*.duckdb
+artifacts/regression/
+artifacts/classification/
+artifacts/ranking/
+artifacts/recommender/
+artifacts/metrics/
+artifacts/reports/
+!artifacts/**/.gitkeep
+
+.DS_Store
+catboost_info/
