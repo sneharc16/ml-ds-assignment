@@ -34,8 +34,8 @@ RELEVANCE = {
 RANK_FEATURES = [
     "content_score", "collaborative_score", "session_score",
     "price_budget_gap", "brand_match", "body_match", "trans_match",
-    "deal_score", "booking_probability", "inspection_score", "vehicle_age",
-    "inventory_age", "market_demand_index", "list_position_propensity",
+    "deal_score", "inspection_score", "vehicle_age",
+    "inventory_age", "market_demand_index",
     "finance_available", "delivery_available", "model_popularity",
 ]
 
@@ -60,6 +60,51 @@ def relevance_from_impression(row: pd.Series) -> int:
     if row.get("clicked"):
         return RELEVANCE["view_item"]
     return 0
+
+
+def _scores_for_rows(content, profile: np.ndarray | None,
+                     car_ids: pd.Series) -> np.ndarray:
+    """Score only the requested cars instead of the full catalog."""
+    out = np.zeros(len(car_ids))
+    if profile is None:
+        return out
+    idx = car_ids.map(content.id_to_idx)
+    ok = idx.notna().to_numpy()
+    if ok.any():
+        out[ok] = np.asarray(content.matrix[idx[ok].astype(int)].dot(profile)).ravel()
+    return out
+
+
+def historical_recommender_scores(df: pd.DataFrame, events: pd.DataFrame,
+                                  bundle: RecommenderBundle) -> pd.DataFrame:
+    """Build recommender features using only events visible at each decision."""
+    out = df.copy()
+    out["content_score"] = 0.0
+    out["session_score"] = 0.0
+    out["collaborative_score"] = 0.0
+    ev = events.copy()
+    ev["event_timestamp"] = pd.to_datetime(ev["event_timestamp"])
+    by_user = {uid: g.sort_values("event_timestamp") for uid, g in ev.groupby("user_id")}
+    for sid, rows in out.groupby("session_id", sort=False):
+        decision = pd.to_datetime(rows["event_timestamp"]).min()
+        uid = rows["user_id"].iloc[0]
+        user_events = by_user.get(uid, ev.iloc[0:0])
+        visible = user_events[user_events["event_timestamp"] <= decision]
+        history = visible[visible["session_id"] != sid]
+        current = visible[visible["session_id"] == sid]
+        long_profile = bundle.content.profile_vector(history, ref_time=decision)
+        session_profile = bundle.content.profile_vector(current, ref_time=decision, decay_per_day=50.0)
+        out.loc[rows.index, "content_score"] = _scores_for_rows(
+            bundle.content, long_profile, rows["car_id"]
+        )
+        out.loc[rows.index, "session_score"] = _scores_for_rows(
+            bundle.content, session_profile, rows["car_id"]
+        )
+        if bundle.collab is not None and uid in bundle.collab.uidx:
+            out.loc[rows.index, "collaborative_score"] = bundle.collab.score_user(
+                uid, list(rows["car_id"])
+            )
+    return out
 
 
 def build_ranking_dataset(cfg: Config) -> pd.DataFrame:
@@ -88,48 +133,13 @@ def build_ranking_dataset(cfg: Config) -> pd.DataFrame:
     df["brand_match"] = (df["make"] == df["preferred_makes"]).astype(int)
     df["body_match"] = (df["body_type"] == df["preferred_body_types"]).astype(int)
     df["trans_match"] = (df["transmission"] == df["preferred_transmissions"]).astype(int)
-    from driveintent.features.build import attach_demand_index, car_base_features
-    demand = attach_demand_index(car_base_features(cars), events)[["car_id", "market_demand_index"]]
-    df = df.merge(demand, on="car_id", how="left")
-    df["market_demand_index"] = df["market_demand_index"].fillna(0.5)
+    df["observation_date"] = pd.to_datetime(df["event_timestamp"])
+    from driveintent.features.build import attach_market_context
+    df = attach_market_context(df, cars, events, "observation_date")
 
     # hybrid recommender scores: content similarity of car to user long-term profile
     bundle = RecommenderBundle.load(cfg)
-    ev_train = events  # profiles here mirror candidate scoring at serve time
-    prof_cache: dict[str, np.ndarray | None] = {}
-    scores_content = np.zeros(len(df))
-    scores_session = np.zeros(len(df))
-    collab = np.zeros(len(df))
-    by_user = dict(list(ev_train.groupby("user_id")))
-    for uid, g in df.groupby("user_id"):
-        uev = by_user.get(uid)
-        if uev is None:
-            continue
-        if uid not in prof_cache:
-            prof_cache[uid] = bundle.content.profile_vector(uev)
-        vec = prof_cache[uid]
-        cs = bundle.content.score(vec)
-        idx = g["car_id"].map(bundle.content.id_to_idx)
-        ok = idx.notna()
-        scores_content[g.index[ok]] = cs[idx[ok].astype(int)]
-        if bundle.collab is not None and uid in bundle.collab.uidx:
-            collab[g.index] = bundle.collab.score_user(uid, list(g["car_id"]))
-    # session score: per-session profile from that session's own clicks (recency-decayed)
-    by_sess = dict(list(ev_train.groupby("session_id")))
-    for sid, g in df.groupby("session_id"):
-        sev = by_sess.get(sid)
-        if sev is None:
-            continue
-        vec = bundle.content.profile_vector(sev, decay_per_day=50.0)
-        if vec is None:
-            continue
-        cs = bundle.content.score(vec)
-        idx = g["car_id"].map(bundle.content.id_to_idx)
-        ok = idx.notna()
-        scores_session[g.index[ok]] = cs[idx[ok].astype(int)]
-    df["content_score"] = scores_content
-    df["session_score"] = scores_session
-    df["collaborative_score"] = collab
+    df = historical_recommender_scores(df, events, bundle)
 
     # model-based features
     pred = price_model.predict(cfg, df)
@@ -150,7 +160,6 @@ def build_ranking_dataset(cfg: Config) -> pd.DataFrame:
     df["list_position_propensity"] = props[pos]
     wmax = cfg.get("recommendation", "maximum_propensity_weight")
     df["ipw"] = np.minimum(1.0 / df["list_position_propensity"], wmax)
-    df["observation_date"] = pd.to_datetime(df["event_timestamp"])
     for c in ("finance_available", "delivery_available"):
         df[c] = df[c].astype(int)
     return df
@@ -242,8 +251,9 @@ def evaluate_rankers(cfg: Config, ranker: CatBoostRanker, test_df: pd.DataFrame)
     pool, sorted_df = _rank_pool(d, with_label=False, with_weight=False)
     sorted_df["ranker_score"] = ranker.predict(pool)
     d = sorted_df
-    rng = np.random.default_rng(cfg.seed)
-    d["popularity_score"] = d.groupby("car_id")["clicked"].transform("mean") + rng.normal(0, 1e-6, len(d))
+    # Catalog popularity is fixed before the test interaction. Never derive a
+    # baseline from test clicks, which would leak the labels being evaluated.
+    d["popularity_score"] = d["model_popularity"].astype(float)
     d["hybrid_score"] = (0.4 * _z(d["content_score"]) + 0.3 * _z(d["collaborative_score"])
                          + 0.3 * _z(d["session_score"]))
     out = {}
