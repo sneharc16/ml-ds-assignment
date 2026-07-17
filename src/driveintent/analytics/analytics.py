@@ -52,7 +52,7 @@ def inventory_match_score(cfg: Config) -> pd.DataFrame:
     SELECT sb.campaign_id,
            COUNT(*) AS demand_sessions,
            AVG(CASE WHEN COALESCE(su.live,0) >= 3 THEN 1.0 ELSE 0.0 END) AS satisfiable_share,
-           AVG(COALESCE(su.live,0)) AS median_eligible_cars
+           MEDIAN(COALESCE(su.live,0)) AS median_eligible_cars
     FROM sess_body sb LEFT JOIN supply su
       ON su.city = sb.city AND su.body_type = sb.body_type
     GROUP BY 1
@@ -74,13 +74,20 @@ def budget_optimizer(cfg: Config, total_budget: float | None = None) -> pd.DataF
     B = float(total_budget or spend.sum())
     lo = 0.3 * spend
     hi = 3.0 * spend
+    if B < lo.sum() or B > hi.sum():
+        raise ValueError(
+            f"total_budget must be between {lo.sum():.0f} and {hi.sum():.0f} "
+            "under the campaign change constraints"
+        )
 
     def neg_total(x):
         return -np.sum(a * np.log1p(b * x))
 
     res = optimize.minimize(neg_total, x0=spend, method="SLSQP",
                             bounds=list(zip(lo, hi)),
-                            constraints=[{"type": "ineq", "fun": lambda x: B - x.sum()}])
+                            constraints=[{"type": "eq", "fun": lambda x: B - x.sum()}])
+    if not res.success:
+        raise RuntimeError(f"budget optimization failed: {res.message}")
     x = res.x
     out = pd.DataFrame(dict(
         campaign=perf["campaign_name"], campaign_id=perf["campaign_id"],
@@ -130,8 +137,16 @@ def price_review_candidates(cfg: Config, top_n: int = 25) -> pd.DataFrame:
 def sample_size_two_proportions(baseline: float, mde_relative: float,
                                 alpha: float = 0.05, power: float = 0.8) -> int:
     """Per-arm sample size for detecting a relative lift in conversion."""
+    if not 0 < baseline < 1:
+        raise ValueError("baseline must be between 0 and 1")
+    if mde_relative <= 0:
+        raise ValueError("mde_relative must be positive")
+    if not 0 < alpha < 1 or not 0 < power < 1:
+        raise ValueError("alpha and power must be between 0 and 1")
     p1 = baseline
     p2 = baseline * (1 + mde_relative)
+    if p2 >= 1:
+        raise ValueError("baseline and relative MDE imply a conversion rate >= 1")
     z_a = stats.norm.ppf(1 - alpha / 2)
     z_b = stats.norm.ppf(power)
     pbar = (p1 + p2) / 2
@@ -144,13 +159,19 @@ def simulate_experiment(cfg: Config, n_per_arm: int = 4000,
                         true_lift: float = 0.15, baseline: float | None = None,
                         seed: int | None = None) -> dict:
     """Simulate a user-randomized A/B test: relevance-only vs intent-aware ranking."""
+    if n_per_arm < 2:
+        raise ValueError("n_per_arm must be at least 2")
     rng = np.random.default_rng(seed if seed is not None else cfg.seed)
     if baseline is None:
         r = db.query(cfg, """
-            SELECT AVG(b) FROM (SELECT session_id,
+            SELECT AVG(b) FROM (SELECT user_id,
                 MAX(CASE WHEN event_name='booking_complete' THEN 1 ELSE 0 END) AS b
-                FROM events GROUP BY 1)""")
+                FROM events GROUP BY user_id)""")
         baseline = float(r.iloc[0, 0])
+    if not 0 < baseline < 1:
+        raise ValueError("baseline must be between 0 and 1")
+    if true_lift <= 0 or baseline * (1 + true_lift) >= 1:
+        raise ValueError("true_lift must be positive and imply a treatment rate below 1")
     ctrl = rng.binomial(1, baseline, n_per_arm)
     trt = rng.binomial(1, min(baseline * (1 + true_lift), 0.99), n_per_arm)
     p1, p2 = ctrl.mean(), trt.mean()
@@ -158,12 +179,14 @@ def simulate_experiment(cfg: Config, n_per_arm: int = 4000,
     z = (p2 - p1) / max(se, 1e-12)
     pval = 2 * (1 - stats.norm.cdf(abs(z)))
     ci = ((p2 - p1) - 1.96 * se, (p2 - p1) + 1.96 * se)
-    power = None
-    try:
-        n_req = sample_size_two_proportions(baseline, true_lift)
-        power = min(n_per_arm / n_req, 1.0)  # rough attained-power proxy
-    except Exception:
-        pass
+    p_alt = baseline * (1 + true_lift)
+    delta = p_alt - baseline
+    pooled = (baseline + p_alt) / 2
+    se_null = math.sqrt(2 * pooled * (1 - pooled) / n_per_arm)
+    se_alt = math.sqrt((baseline * (1 - baseline) + p_alt * (1 - p_alt)) / n_per_arm)
+    critical = stats.norm.ppf(0.975) * se_null
+    attained_power = (stats.norm.cdf((-critical - delta) / se_alt)
+                      + 1 - stats.norm.cdf((critical - delta) / se_alt))
     return dict(
         randomization_unit="user_id (session-level randomization risks the same user "
                            "seeing both rankings, contaminating treatment)",
@@ -171,7 +194,7 @@ def simulate_experiment(cfg: Config, n_per_arm: int = 4000,
         absolute_lift=round(float(p2 - p1), 4),
         relative_lift=round(float((p2 - p1) / max(p1, 1e-9)), 4),
         ci_95=[round(ci[0], 4), round(ci[1], 4)], p_value=round(float(pval), 5),
-        approx_power=round(power, 3) if power else None,
+        approx_power=round(float(attained_power), 3),
         interpretation=("Statistically significant" if pval < 0.05 else "Not significant")
                        + "; practical significance depends on lead-handling economics.")
 
@@ -194,7 +217,7 @@ def ablation_study(cfg: Config) -> pd.DataFrame:
         "no_session_intent": ["session_score"],
         "no_collaborative": ["collaborative_score"],
         "no_price_deal": ["deal_score"],
-        "no_booking_probability": ["booking_probability"],
+        "no_market_context": ["market_demand_index"],
     }
     p = cfg.get("models", "ranker")
     rows = []

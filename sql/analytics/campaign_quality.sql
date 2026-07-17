@@ -20,7 +20,7 @@ agg AS (
     FROM sess GROUP BY 1
 )
 SELECT c.campaign_id, c.campaign_name, c.channel,
-    ROUND(c.daily_budget * GREATEST(DATE_DIFF('day', c.start_date, c.end_date), 1) / 100.0, 0) AS spend,
+    ROUND(c.daily_budget * GREATEST(DATE_DIFF('day', c.start_date, c.end_date) + 1, 1), 0) AS planned_budget,
     a.sessions,
     ROUND(a.sessions * c.cost_per_click, 0) AS click_cost,
     a.qualified_sessions, a.leads, a.bookings, a.purchases,

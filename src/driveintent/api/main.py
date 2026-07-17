@@ -125,7 +125,7 @@ class SellthroughInput(BaseModel):
 
 
 class BudgetInput(BaseModel):
-    total_budget: Optional[float] = None
+    total_budget: Optional[float] = Field(default=None, gt=0)
 
 
 # ---------------------------- endpoints -------------------------------------
@@ -290,7 +290,10 @@ def campaign_perf():
 @app.post("/api/v1/campaigns/optimize-budget")
 def optimize_budget(inp: BudgetInput):
     from driveintent.analytics.analytics import budget_optimizer
-    df = budget_optimizer(_cfg(), total_budget=inp.total_budget)
+    try:
+        df = budget_optimizer(_cfg(), total_budget=inp.total_budget)
+    except ValueError as e:
+        raise HTTPException(422, str(e))
     return dict(note="Scenario simulation based on synthetic response curves, "
                      "not a production Google Ads bidding system.",
                 allocation=_jsonable(df.to_dict(orient="records")))

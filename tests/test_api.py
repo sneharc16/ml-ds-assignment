@@ -80,3 +80,5 @@ def test_inventory_and_campaigns(client):
     assert client.get("/api/v1/campaigns/performance").status_code == 200
     r = client.post("/api/v1/campaigns/optimize-budget", json={})
     assert r.status_code == 200 and "allocation" in r.json()
+    assert client.post("/api/v1/campaigns/optimize-budget",
+                       json={"total_budget": -1}).status_code == 422
