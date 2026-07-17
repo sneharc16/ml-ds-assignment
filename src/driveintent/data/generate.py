@@ -346,13 +346,22 @@ def generate_sessions_events(cfg: Config, gen_cfg: dict, rng: np.random.Generato
     n_sessions = int(gen_cfg["n_sessions"])
     start = pd.Timestamp(gen_cfg["start_date"]) + pd.Timedelta(days=15)
     end = pd.Timestamp(gen_cfg["end_date"])
+    start = max(start, pd.to_datetime(users["signup_date"]).min())
     horizon = (end - start).days
     props = np.array(cfg.get("position_bias", "propensities"))
 
-    # heavy users generate more sessions (zipf-ish)
+    # Heavy users generate more sessions (zipf-ish).  Generate the timeline
+    # first and process it chronologically so sequence numbers and inventory
+    # availability describe the same point in time.
     user_w = rng.pareto(1.6, len(users)) + 1
     user_w /= user_w.sum()
-    user_idx = rng.choice(len(users), size=n_sessions, p=user_w)
+    session_starts = [
+        start + pd.Timedelta(days=int(rng.integers(0, horizon)),
+                             seconds=int(rng.integers(7 * 3600, 23 * 3600)))
+        for _ in range(n_sessions)
+    ]
+    session_starts.sort()
+    signup_dates = pd.to_datetime(users["signup_date"]).to_numpy()
 
     camp_w = campaigns["daily_budget"].values + 5000
     camp_w = camp_w / camp_w.sum()
@@ -362,6 +371,7 @@ def generate_sessions_events(cfg: Config, gen_cfg: dict, rng: np.random.Generato
 
     sess_rows, event_rows, imp_rows = [], [], []
     seq_counter: dict[str, int] = {}
+    purchased_car_ids: set[str] = set()
     eid = 0
 
     def emit(ts, u, sid, name, car_id=None, pos=None, term=None, fname=None, fval=None,
@@ -376,8 +386,11 @@ def generate_sessions_events(cfg: Config, gen_cfg: dict, rng: np.random.Generato
             source=src, medium=med, campaign_id=cmp_, device_category=dev, city=city))
         eid += 1
 
-    for si in range(n_sessions):
-        u = users.iloc[user_idx[si]]
+    for si, ts0 in enumerate(session_starts):
+        eligible = signup_dates <= ts0.to_datetime64()
+        eligible_w = user_w * eligible
+        eligible_w /= eligible_w.sum()
+        u = users.iloc[rng.choice(len(users), p=eligible_w)]
         uid = u["user_id"]
         seq = seq_counter.get(uid, 0) + 1
         seq_counter[uid] = seq
@@ -390,8 +403,6 @@ def generate_sessions_events(cfg: Config, gen_cfg: dict, rng: np.random.Generato
             if len(direct):
                 camp = direct.iloc[rng.integers(0, len(direct))]
 
-        ts0 = start + pd.Timedelta(days=int(rng.integers(0, horizon)),
-                                   seconds=int(rng.integers(7 * 3600, 23 * 3600)))
         sid = f"SES_{si:06d}"
         device = rng.choice(DEVICES, p=[0.68, 0.27, 0.05])
         city = u["home_city"] if rng.random() < 0.92 else rng.choice(CITY_NAMES)
@@ -429,9 +440,14 @@ def generate_sessions_events(cfg: Config, gen_cfg: dict, rng: np.random.Generato
         entry_ok = pd.to_datetime(pool_all["inventory_entry_date"]) <= ts0
         exit_dt = pd.to_datetime(pool_all["inventory_exit_date"])
         not_sold_yet = exit_dt.isna() | (exit_dt >= ts0)
-        pool = pool_all[entry_ok & not_sold_yet]
+        not_purchased = ~pool_all["car_id"].isin(purchased_car_ids)
+        pool = pool_all[entry_ok & not_sold_yet & not_purchased]
         if len(pool) < 5:
-            pool = cars[pd.to_datetime(cars["inventory_entry_date"]) <= ts0]
+            entry_ok = pd.to_datetime(cars["inventory_entry_date"]) <= ts0
+            exit_dt = pd.to_datetime(cars["inventory_exit_date"])
+            not_sold_yet = exit_dt.isna() | (exit_dt >= ts0)
+            not_purchased = ~cars["car_id"].isin(purchased_car_ids)
+            pool = cars[entry_ok & not_sold_yet & not_purchased]
         if len(pool) == 0:
             emit(t, uid, sid, "session_end", src=camp["source"], med=camp["medium"],
                  cmp_=camp["campaign_id"], dev=device, city=city)
@@ -561,6 +577,13 @@ def generate_sessions_events(cfg: Config, gen_cfg: dict, rng: np.random.Generato
                              dev=device, city=city)
                         row["purchased"] = True
                         purchased_session = True
+                        purchased_car_ids.add(car["car_id"])
+                        car_idx = cars.index[cars["car_id"] == car["car_id"]][0]
+                        cars.at[car_idx, "inventory_exit_date"] = t.date()
+                        cars.at[car_idx, "days_in_inventory"] = max(
+                            0,
+                            (t.normalize() - pd.Timestamp(cars.at[car_idx, "inventory_entry_date"])).days,
+                        )
             imp_rows.append(row)
 
         t += pd.Timedelta(seconds=int(rng.integers(3, 30)))
