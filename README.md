@@ -145,7 +145,7 @@ driveintent/
 
 ```bash
 # 1. install (editable, with dev extras)
-make install            # or: pip install -e ".[dev]"
+make install            # or: python3 -m pip install -e ".[dev]"
 
 # 2. run the whole pipeline on the fast "small" profile (~1 min)
 make pipeline-small     # data -> db -> features -> models -> reports -> smoke test
@@ -186,9 +186,9 @@ The DGP (`data/generate.py`) is the heart of the project. Highlights:
   the ranker must later undo. Bookings depend on deep engagement, urgency, deal quality
   and price mismatch.
 
-Validation (`data/validate.py`) checks schemas, referential integrity, funnel
-monotonicity and — crucially — that no forbidden (leaky/latent) column is ever used as
-a feature.
+Validation (`data/validate.py`) checks schemas, referential integrity, chronological
+session sequences, impression funnels, unique purchases, and purchase/inventory-date
+agreement. It also rejects forbidden outcome and latent columns in model feature lists.
 
 ## 7. Leakage & latent-variable discipline
 
@@ -196,9 +196,10 @@ The variables that *generate* behavior — `latent_fair_price`, `deal_latent`, s
 intents — are stored separately (`data/raw/_latents_*.parquet`) and are **never**
 model features. `FORBIDDEN_FEATURES` in `validate.py` plus `validate_feature_list()`
 enforce this, and `tests/test_features.py::test_no_leakage_in_feature_lists` fails the
-build if a leaky column sneaks into any feature list. Booking/sell-through features use
-only information available *at prediction time* (leak-free `prior_*` counters via
-`cumcount`/`shift`, engagement counters truncated at the snapshot date).
+build if a leaky column sneaks into any feature list. Price, booking, sell-through, and ranking rows use only information available at
+their observation timestamp. Market demand and live supply are computed as-of that
+time; booking counters stop at the recommendation decision; ranking profiles exclude
+future and label-session outcomes.
 
 ## 8. Temporal validation
 
@@ -209,8 +210,8 @@ This mirrors how a marketplace model is actually deployed against future traffic
 
 ## 9. Models
 
-| Task | Model | Baselines it must beat | Calibration |
-|------|-------|------------------------|-------------|
+| Task | Model | Comparison baselines | Calibration |
+|------|-------|----------------------|-------------|
 | Fair price (P50) | CatBoost RMSE | global median, make-model median, Ridge | — |
 | Price interval | CatBoost quantiles (α=.1/.5/.9) + **conformal** width | — | conformalized on val |
 | Booking (lead quality) | CatBoost (class-weighted) | prevalence, logistic regression | isotonic / Platt |
@@ -227,7 +228,8 @@ ALS with a deterministic TruncatedSVD fallback.
 Because clicks are contaminated by examination bias, the ranking labels are corrected
 with **inverse-propensity weights** `w = min(1/propensity(position), w_max)`, clipped
 to avoid variance blow-up at deep positions. The propensity curve is exactly the one
-used during generation, so the correction is checkable. Offline evaluation compares
+used during generation, so the correction is checkable. Propensity is used only for
+training weights; logging position is not a ranker input or serving feature. Offline evaluation compares
 popularity / content / collaborative / session / weighted-hybrid / LTR / reranked
 strategies on NDCG@5/10, MAP@10, Recall@5/10, HitRate, MRR, Coverage@10 and brand
 concentration.
@@ -264,51 +266,25 @@ not a production bidding system.
 ## 14. A/B testing toolkit
 
 Two-proportion **sample-size** calculation (α, power, MDE), plus a simulated
-user-randomized experiment returning lift, 95% CI, p-value and an attained-power
-proxy. The toolkit is opinionated about **randomization unit** (user, not session, to
+user-randomized experiment returning lift, 95% CI, p-value and approximate attained
+power under the alternative distribution. The toolkit is opinionated about **randomization unit** (user, not session, to
 avoid the same user seeing both rankings) and about separating statistical from
 practical significance.
 
-## 15. Results (small profile)
+## 15. Results and reproducibility
 
-Numbers below are from the fast **small** profile (200 users / 300 cars / 500 sessions)
-used for CI and reproducibility. They are intentionally modest — small data — and the
-full-scale profile produces stronger, lower-variance results.
+Metrics are generated artifacts, not fixed claims in this README. Run `make
+pipeline-small` for the CI-scale profile or `make pipeline` for the documented full
+profile, then inspect:
 
-**Fair price (test window)**
+- `artifacts/metrics/*_metrics.json` for model metrics;
+- `artifacts/metrics/ranking_metrics.json` for honest temporal ranking comparisons;
+- `artifacts/reports/ablation_results.csv` for signal ablations;
+- `artifacts/reports/model_comparison.csv` for the model inventory.
 
-| Model | MAE | RMSE | R² |
-|-------|-----|------|----|
-| Global-median baseline | ₹314,540 | — | — |
-| Make-model-median baseline | ₹284,779 | — | — |
-| Ridge baseline | ₹148,309 | — | — |
-| **CatBoost** | ₹166,714 | ₹238,258 | 0.701 |
-
-Conformalized P10–P90 coverage ≈ 0.94 against an 0.80 target (conservative on a
-~50-row validation window; converges toward target at scale).
-
-**Conversion (calibrated, test window)**
-
-| Model | PR-AUC | ROC-AUC | Brier | ECE | Lift@10% |
-|-------|--------|---------|-------|-----|----------|
-| Booking (base rate 3.5%) | 0.155 | 0.824 | 0.032 | 0.005 | 5.0× |
-| Sell-through (base 26%) | 0.349 | 0.568 | 0.192 | 0.029 | — |
-
-**Ranking (NDCG@10, test window)**
-
-| Strategy | NDCG@10 | MAP@10 | Recall@10 | Coverage@10 |
-|----------|---------|--------|-----------|-------------|
-| Popularity | 0.640 | 0.702 | 0.936 | 0.589 |
-| Content-only | 0.832 | 0.762 | 0.902 | 0.754 |
-| Collaborative-only | 0.790 | 0.834 | 0.989 | 0.720 |
-| Session-only | 0.940 | 0.878 | 0.908 | 0.754 |
-| Weighted hybrid | 0.956 | 0.930 | 0.959 | 0.758 |
-| **LTR (IPW)** | **0.960** | **0.959** | **0.995** | 0.758 |
-| Multi-objective rerank | 0.940 | 0.938 | 0.990 | 0.742 |
-
-The reranker trades a little raw NDCG for diversity and business objectives —
-exactly the intended behavior. See `artifacts/reports/ablation_results.csv` for the
-signal-ablation study (dropping session intent is the single largest NDCG hit).
+This avoids presenting stale results after changes to the DGP, temporal safeguards,
+feature contracts, or evaluation methodology. Small-profile numbers are useful for
+reproducibility and integration testing, not real-market performance claims.
 
 ## 16. API
 
@@ -348,13 +324,12 @@ user-intent analysis and recommendation metrics. Every file is executed by
 
 ## 19. Testing
 
-34 pytest tests covering data generation (reproducibility, key uniqueness, price
-monotonicity, position-bias presence, funnel consistency), validation (leakage guards),
-features (entropy bounds, no future leakage), models (quantile ordering, beats
-baseline, calibrated probabilities, artifact round-trip, SHAP), recommender (dedup,
-sold-car exclusion, hard constraints, cold-start, diversity), ranking (NDCG math, beats
-popularity, IPW clipping), SQL and the API. A session-scoped fixture runs the small
-pipeline once and shares it across tests.
+Pytest covers deterministic data generation, relational validation, point-in-time
+features, models and artifacts, recommender behavior, ranking math and leakage guards,
+SQL, analytics/experiment calculations, and API request integrity. A session-scoped
+fixture runs the small pipeline once and shares it across tests. GitHub Actions installs
+the project, runs Ruff, and executes the full suite on pull requests and pushes to
+`main`; secret scanning runs as a separate required check.
 
 ## 20. Configuration
 
@@ -365,8 +340,10 @@ hyperparameters. Seed is fixed (42) throughout.
 
 ## 21. Docker
 
-`docker compose up --build` starts the API (8000) and dashboard (8501), mounting
-`data/` and `artifacts/` so a locally-run pipeline is served by the containers.
+Run `make pipeline-small` (or `make pipeline`) first, then `docker compose up
+--build`. Compose starts the API (8000) and dashboard (8501), mounting `data/` and
+`artifacts/` so the host-generated database and model artifacts are served by both
+containers.
 
 ## 22. Business insights
 
@@ -385,10 +362,9 @@ hyperparameters. Seed is fixed (42) throughout.
 
 - **Synthetic data.** All results demonstrate methodology; they are not CARS24
   performance. Model quality is bounded by how faithfully the DGP mimics reality.
-- **Small-profile numbers are modest and noisy.** On the 300-car profile the **Ridge
-  baseline edges CatBoost on MAE** — tree models need more data to pull ahead, and the
-  conformal interval overshoots its coverage target on a ~50-row validation window.
-  Both are expected small-sample artifacts; the full profile narrows them.
+- **Small-profile results are modest and noisy.** They are intended for integration
+  testing, not performance claims. Re-run the pipeline after code or DGP changes and
+  use the generated metric artifacts rather than copied historical numbers.
 - **Sell-through is the weakest model** (ROC ≈ 0.57 small-profile): 30-day sale is
   largely driven by the latent deal quality we deliberately withhold, so the observable
   features leave real irreducible error — an honest ceiling, not a bug.

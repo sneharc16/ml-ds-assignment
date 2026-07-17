@@ -1,7 +1,7 @@
 PY ?= python3
 
 install:
-	pip install -e ".[dev]"
+	$(PY) -m pip install -e ".[dev]"
 
 generate-data:
 	$(PY) scripts/generate_data.py
@@ -37,13 +37,15 @@ security-check:
 	$(PY) scripts/check_secrets.py
 
 test: security-check
-	pytest -q
+	$(PY) -m pytest -q
 
 lint:
-	ruff check src scripts tests
+	$(PY) -m ruff check src scripts tests
 
 format:
-	black src scripts tests
+	$(PY) -m black src scripts tests
+
+ci: security-check lint test
 
 smoke-test:
 	$(PY) scripts/smoke_test.py
