@@ -7,7 +7,7 @@ from typing import Any, Optional
 
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from driveintent.config import Config, load_config
 from driveintent.models import classifiers
@@ -47,6 +47,8 @@ async def lifespan(app: FastAPI):
         registry.load_model(cfg, "classification", "booking")
         registry.load_model(cfg, "classification", "sellthrough")
         registry.load_model(cfg, "ranking", "ranker")
+        from driveintent.models.recommender import RecommenderBundle
+        RecommenderBundle.load(cfg)
         STATE["models_loaded"] = True
     except ModelArtifactNotFoundError as e:
         log.warning("Model artifacts missing: %s", e)
@@ -87,7 +89,13 @@ class CarInput(BaseModel):
     engine_score: float = 80
     tyre_score: float = 75
     number_of_features: int = 10
-    listed_price: Optional[float] = None
+    listed_price: Optional[float] = Field(default=None, gt=0)
+
+    @model_validator(mode="after")
+    def registration_follows_manufacture(self):
+        if self.registration_year is not None and self.registration_year < self.manufacturing_year:
+            raise ValueError("registration_year cannot precede manufacturing_year")
+        return self
 
 
 class BookingInput(BaseModel):
@@ -97,10 +105,23 @@ class BookingInput(BaseModel):
     features: dict[str, Any] = Field(default_factory=dict,
                                      description="Override any booking-model feature")
 
+    @model_validator(mode="after")
+    def require_feature_source(self):
+        pair = self.session_id is not None and self.car_id is not None
+        if (self.session_id is None) != (self.car_id is None):
+            raise ValueError("session_id and car_id must be supplied together")
+        if not pair and not self.features:
+            raise ValueError("provide session_id/car_id or explicit model features")
+        from driveintent.features.build import BOOKING_FEATURES
+        unknown = set(self.features) - set(BOOKING_FEATURES)
+        if unknown:
+            raise ValueError(f"unknown booking features: {sorted(unknown)}")
+        return self
+
 
 class SellthroughInput(BaseModel):
     car_id: str
-    snapshot_age: int = 0
+    snapshot_age: int = Field(default=0, ge=0)
 
 
 class BudgetInput(BaseModel):
@@ -111,23 +132,41 @@ class BudgetInput(BaseModel):
 @app.get("/health")
 def health():
     cfg = _cfg()
-    return dict(status="healthy",
-                database="connected" if cfg.database.exists() else "missing",
-                models_loaded=STATE.get("models_loaded", False),
+    database_ready = cfg.database.exists()
+    models_ready = STATE.get("models_loaded", False)
+    return dict(status="healthy" if database_ready and models_ready else "degraded",
+                database="connected" if database_ready else "missing",
+                models_loaded=models_ready,
                 version="1.0.0")
+
+
+def _price_features(cfg: Config, car: CarInput) -> dict[str, Any]:
+    """Construct pricing features from the latest observable marketplace state."""
+    row = car.model_dump()
+    row["registration_year"] = row["registration_year"] or row["manufacturing_year"]
+    cars = pd.read_parquet(cfg.raw_data / "cars.parquet")
+    events = pd.read_parquet(cfg.raw_data / "events.parquet")
+    as_of = pd.to_datetime(events["event_timestamp"]).max()
+    row["vehicle_age"] = max(as_of.year - row["manufacturing_year"], 0)
+    row["kilometres_per_year"] = row["kilometres_driven"] / max(row["vehicle_age"], 1)
+    row["inventory_entry_month"] = as_of.month
+    comparable = cars[(cars["make"] == row["make"]) & (cars["model"] == row["model"])]
+    popularity = comparable["model_popularity"].median()
+    row["model_popularity"] = float(
+        popularity if pd.notna(popularity) else cars["model_popularity"].median()
+    )
+    context_row = pd.DataFrame([{**row, "observation_date": as_of}])
+    from driveintent.features.build import attach_market_context
+    context = attach_market_context(context_row, cars, events, "observation_date").iloc[0]
+    row["market_demand_index"] = float(context["market_demand_index"])
+    row["local_supply_index"] = float(context["local_supply_index"])
+    return row
 
 
 @app.post("/api/v1/pricing/predict")
 def predict_price(car: CarInput):
     cfg = _cfg()
-    row = car.model_dump()
-    row["registration_year"] = row["registration_year"] or row["manufacturing_year"]
-    row["vehicle_age"] = max(2026 - row["manufacturing_year"], 0)
-    row["kilometres_per_year"] = row["kilometres_driven"] / max(row["vehicle_age"], 1)
-    row["inventory_entry_month"] = 7
-    row["market_demand_index"] = 1.0
-    row["local_supply_index"] = 0.2
-    row["model_popularity"] = 0.75
+    row = _price_features(cfg, car)
     try:
         pred = price_model.predict(cfg, row)
         factors = price_model.explain(cfg, row, top_k=5)
@@ -148,13 +187,15 @@ def predict_price(car: CarInput):
 @app.post("/api/v1/conversion/booking-probability")
 def booking_probability(inp: BookingInput):
     cfg = _cfg()
-    ds = pd.read_parquet(cfg.processed_data / "booking_dataset.parquet")
     if inp.session_id and inp.car_id:
+        ds = pd.read_parquet(cfg.processed_data / "booking_dataset.parquet")
         rows = ds[(ds["session_id"] == inp.session_id) & (ds["car_id"] == inp.car_id)]
         if rows.empty:
             raise HTTPException(404, "session_id/car_id pair not found in feature store")
+        if inp.user_id and rows["user_id"].iloc[0] != inp.user_id:
+            raise HTTPException(404, "session_id/car_id pair does not belong to user_id")
     else:
-        rows = ds.sample(1, random_state=0)
+        rows = pd.DataFrame([inp.features])
     rows = rows.head(1).copy()
     for k, v in inp.features.items():
         if k in rows.columns:
@@ -196,9 +237,15 @@ def recommendations(user_id: str, session_id: Optional[str] = None,
                     limit: int = Query(10, ge=1, le=50),
                     diversity_level: Optional[str] = Query(None, pattern="^(low|medium|high)$"),
                     include_explanations: bool = True):
+    cfg = _cfg()
+    if session_id is not None:
+        events = pd.read_parquet(cfg.raw_data / "events.parquet")
+        owned = ((events["session_id"] == session_id) & (events["user_id"] == user_id)).any()
+        if not owned:
+            raise HTTPException(404, "session_id does not belong to user_id")
     from driveintent.models.ranking import recommend_for_user
     try:
-        out = recommend_for_user(_cfg(), user_id, session_id=session_id,
+        out = recommend_for_user(cfg, user_id, session_id=session_id,
                                  limit=limit, diversity_level=diversity_level)
     except ModelArtifactNotFoundError as e:
         raise HTTPException(503, str(e))
@@ -218,6 +265,8 @@ def user_intent(user_id: str, session_id: Optional[str] = None):
     if ue.empty:
         raise HTTPException(404, f"No events for user {user_id}")
     sid = session_id or ue.sort_values("event_timestamp")["session_id"].iloc[-1]
+    if not (ue["session_id"] == sid).any():
+        raise HTTPException(404, "session_id does not belong to user_id")
     prof = infer_profile(ue, cars, session_id=sid)
     return _jsonable(dict(user_id=user_id, session_id=sid, **prof.to_dict()))
 
