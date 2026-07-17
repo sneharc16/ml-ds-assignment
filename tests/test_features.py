@@ -1,7 +1,13 @@
 import pandas as pd
 
 from driveintent.data.validate import validate_feature_list
-from driveintent.features.build import BOOKING_FEATURES, PRICE_FEATURES, SELL_FEATURES
+from driveintent.features.build import (
+    BOOKING_FEATURES,
+    PRICE_FEATURES,
+    SELL_FEATURES,
+    build_booking_dataset,
+    build_price_dataset,
+)
 from driveintent.features.intent import entropy, infer_profile
 
 
@@ -37,3 +43,22 @@ def test_sellthrough_no_future_engagement(pipeline):
     # day-0 snapshots should have (near) zero engagement counters
     d0 = ds[ds["snapshot_age"] == 0]
     assert d0["views"].median() == 0
+
+
+def test_price_observation_is_listing_time(tables):
+    ds = build_price_dataset(tables["cars"], tables["events"])
+    entry = pd.to_datetime(tables["cars"].set_index("car_id")["inventory_entry_date"])
+    assert ds["observation_date"].eq(ds["car_id"].map(entry)).all()
+
+
+def test_booking_features_ignore_post_decision_events(tables):
+    args = [tables[name] for name in ("impressions", "sessions", "users", "cars")]
+    baseline = build_booking_dataset(*args, tables["events"])
+    events = tables["events"].copy()
+    future = events[events["event_name"] == "session_end"].copy()
+    future["event_id"] = "FUTURE_" + future["event_id"]
+    future["event_name"] = "booking_complete"
+    changed = build_booking_dataset(*args, pd.concat([events, future], ignore_index=True))
+    cols = ["session_duration_s", "session_searches", "session_filters", "session_events",
+            "market_demand_index", "local_supply_index"]
+    pd.testing.assert_frame_equal(baseline[cols], changed[cols])
