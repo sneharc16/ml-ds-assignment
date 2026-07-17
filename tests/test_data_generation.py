@@ -4,9 +4,10 @@ from driveintent.data.generate import build_all
 
 
 def test_reproducible_under_fixed_seed(cfg):
-    a = build_all(cfg, small=True)["cars"]
-    b = build_all(cfg, small=True)["cars"]
-    pd.testing.assert_frame_equal(a, b)
+    a = build_all(cfg, small=True)
+    b = build_all(cfg, small=True)
+    for table in a:
+        pd.testing.assert_frame_equal(a[table], b[table])
 
 
 def test_keys_unique(tables):
@@ -37,6 +38,25 @@ def test_funnel_consistency(tables):
     counts = ev["event_name"].value_counts()
     assert counts["view_item"] >= counts.get("booking_complete", 0)
     assert counts.get("booking_complete", 0) >= counts.get("purchase", 0)
+
+
+def test_sessions_follow_signup_and_chronological_sequence(tables):
+    sessions = tables["sessions"].merge(
+        tables["users"][["user_id", "signup_date"]], on="user_id", validate="many_to_one"
+    )
+    assert (sessions["session_start"] >= pd.to_datetime(sessions["signup_date"])).all()
+    ordered = sessions.sort_values(["user_id", "session_start"])
+    expected = ordered.groupby("user_id").cumcount() + 1
+    assert ordered["session_sequence_number"].eq(expected).all()
+
+
+def test_purchase_events_match_inventory(tables):
+    purchases = tables["events"].query("event_name == 'purchase'").merge(
+        tables["cars"][["car_id", "inventory_exit_date"]], on="car_id", validate="one_to_one"
+    )
+    assert pd.to_datetime(purchases["event_timestamp"]).dt.normalize().eq(
+        pd.to_datetime(purchases["inventory_exit_date"])
+    ).all()
 
 
 def test_target_rates_reasonable(tables):
