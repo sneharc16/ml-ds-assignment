@@ -33,7 +33,10 @@ api:
 dashboard:
 	streamlit run src/driveintent/dashboard/app.py --server.port 8501
 
-test:
+security-check:
+	$(PY) scripts/check_secrets.py
+
+test: security-check
 	pytest -q
 
 lint:
