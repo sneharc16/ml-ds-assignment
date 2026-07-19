@@ -16,6 +16,18 @@ def test_health(client):
     assert r.json()["models_loaded"] is True
 
 
+def test_root_describes_public_service(client):
+    r = client.get("/")
+    assert r.status_code == 200
+    assert r.json() == {
+        "service": "DriveIntent API",
+        "status": "running",
+        "health": "/health",
+        "docs": "/docs",
+        "dashboard": "https://driveintent-dashboard.onrender.com",
+    }
+
+
 def test_pricing_valid(client):
     r = client.post("/api/v1/pricing/predict", json=dict(
         make="Hyundai", model="Creta", body_type="SUV", fuel_type="Petrol",
