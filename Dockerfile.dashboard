@@ -15,6 +15,10 @@ COPY configs ./configs
 COPY sql ./sql
 COPY scripts ./scripts
 
+# Package the same quality-gated demo artifacts used by the API. This lets the
+# Streamlit process bind immediately when a free Render instance wakes up.
+RUN python scripts/run_pipeline.py --small
+
 EXPOSE 8501
 HEALTHCHECK --interval=30s --timeout=5s --start-period=180s --retries=5 \
   CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8501/_stcore/health', timeout=3)"

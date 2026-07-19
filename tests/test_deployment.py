@@ -14,5 +14,9 @@ def test_render_blueprint_defines_both_health_checked_services():
 
 
 def test_containers_use_verified_serving_entrypoint():
-    assert 'scripts/serve.py", "api"' in (ROOT / "Dockerfile.api").read_text()
-    assert 'scripts/serve.py", "dashboard"' in (ROOT / "Dockerfile.dashboard").read_text()
+    api_dockerfile = (ROOT / "Dockerfile.api").read_text()
+    dashboard_dockerfile = (ROOT / "Dockerfile.dashboard").read_text()
+    assert 'scripts/serve.py", "api"' in api_dockerfile
+    assert 'scripts/serve.py", "dashboard"' in dashboard_dockerfile
+    assert "RUN python scripts/run_pipeline.py --small" in api_dockerfile
+    assert "RUN python scripts/run_pipeline.py --small" in dashboard_dockerfile

@@ -131,6 +131,18 @@ class BudgetInput(BaseModel):
 
 
 # ---------------------------- endpoints -------------------------------------
+@app.get("/", include_in_schema=False)
+def root():
+    """Provide a useful landing response for browsers and deployment checks."""
+    return {
+        "service": "DriveIntent API",
+        "status": "running",
+        "health": "/health",
+        "docs": "/docs",
+        "dashboard": "https://driveintent-dashboard.onrender.com",
+    }
+
+
 @app.get("/health")
 def health():
     cfg = _cfg()
