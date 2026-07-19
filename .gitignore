@@ -21,6 +21,10 @@ artifacts/ranking/
 artifacts/recommender/
 artifacts/metrics/
 artifacts/reports/
+artifacts/monitoring/
+artifacts/model_manifest.json
+artifacts/.bootstrap.lock
+data/ga4_canonical/
 !artifacts/**/.gitkeep
 
 .DS_Store

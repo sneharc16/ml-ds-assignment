@@ -10,6 +10,10 @@ services:
       - ./artifacts:/app/artifacts
     environment:
       - DRIVEINTENT_ROOT=/app
+      - DRIVEINTENT_BOOTSTRAP_DEMO=1
+      - OMP_NUM_THREADS=1
+      - OPENBLAS_NUM_THREADS=1
+      - MKL_NUM_THREADS=1
 
   dashboard:
     build:
@@ -22,5 +26,10 @@ services:
       - ./artifacts:/app/artifacts
     environment:
       - DRIVEINTENT_ROOT=/app
+      - DRIVEINTENT_BOOTSTRAP_DEMO=1
+      - OMP_NUM_THREADS=1
+      - OPENBLAS_NUM_THREADS=1
+      - MKL_NUM_THREADS=1
     depends_on:
-      - api
+      api:
+        condition: service_healthy

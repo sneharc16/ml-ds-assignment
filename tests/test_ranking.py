@@ -38,3 +38,10 @@ def test_ipw_weights_clipped(pipeline):
     wmax = cfg.get("recommendation", "maximum_propensity_weight")
     assert df["ipw"].max() <= wmax + 1e-9
     assert (df["ipw"] >= 1.0).all()
+
+
+def test_validation_selected_champion_is_deployed(pipeline):
+    import json
+    metrics = json.loads((pipeline.artifacts / "metrics" / "ranking_metrics.json").read_text())
+    assert metrics["deployed_champion"]["ndcg_at_10"] >= 0.50
+    assert metrics["validation_selection"]["basis"].startswith("maximum NDCG@10")

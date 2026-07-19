@@ -82,3 +82,18 @@ def test_inventory_and_campaigns(client):
     assert r.status_code == 200 and "allocation" in r.json()
     assert client.post("/api/v1/campaigns/optimize-budget",
                        json={"total_budget": -1}).status_code == 422
+
+
+def test_monitoring_endpoints(client):
+    status = client.get("/api/v1/monitoring/status")
+    assert status.status_code == 200 and status.json()["deployment_ready"] is True
+    drift = client.get("/api/v1/monitoring/drift?severity=critical&limit=5")
+    assert drift.status_code == 200 and len(drift.json()["features"]) <= 5
+
+
+def test_allowlisted_sql_insight_endpoint(client):
+    response = client.get("/api/v1/sql/insights/cohort_retention?limit=3")
+    assert response.status_code == 200
+    assert response.json()["query"] == "cohort_retention"
+    assert len(response.json()["rows"]) <= 3
+    assert client.get("/api/v1/sql/insights/../../secrets").status_code in {404, 422}

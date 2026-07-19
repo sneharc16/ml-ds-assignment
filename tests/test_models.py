@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+import pytest
 
 from driveintent.models import classifiers, price
 from driveintent.models.registry import load_model
@@ -43,3 +44,23 @@ def test_shap_explanations(pipeline):
     ds = pd.read_parquet(cfg.processed_data / "price_dataset.parquet")
     out = price.explain(cfg, ds.iloc[0].to_dict(), top_k=3)
     assert len(out) == 3 and {"feature", "direction", "importance"} <= set(out[0])
+
+
+def test_registry_rejects_corrupted_model_artifact(pipeline):
+    from driveintent.models.registry import ModelArtifactIntegrityError
+    path = pipeline.artifacts / "classification" / "booking_v1" / "model.joblib"
+    original = path.read_bytes()
+    try:
+        path.write_bytes(original + b"tampered")
+        with pytest.raises(ModelArtifactIntegrityError, match="Checksum"):
+            load_model(pipeline, "classification", "booking")
+    finally:
+        path.write_bytes(original)
+
+
+def test_model_manifest_covers_deployed_models(pipeline):
+    import json
+    manifest = json.loads((pipeline.artifacts / "model_manifest.json").read_text())
+    keys = set(manifest["artifacts"])
+    assert {"regression/price", "classification/booking", "classification/sellthrough",
+            "ranking/ranker", "recommender/bundle"} <= keys

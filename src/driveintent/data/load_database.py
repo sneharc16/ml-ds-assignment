@@ -26,12 +26,23 @@ def initialize(cfg: Config) -> None:
         pq = cfg.raw_data / f"{t}.parquet"
         con.execute(f"DELETE FROM {t}")
         con.execute(f"INSERT INTO {t} SELECT * FROM read_parquet('{pq.as_posix()}')")
+    for mart in sorted((cfg.root / "sql" / "marts").glob("*.sql")):
+        con.execute(mart.read_text())
     con.close()
 
 
 def run_sql_file(cfg: Config, name: str) -> pd.DataFrame:
     """Execute an analytics SQL file (relative to sql/analytics) and return a DataFrame."""
     path = cfg.root / "sql" / "analytics" / name
+    con = connect(cfg, read_only=True)
+    try:
+        return con.execute(path.read_text()).df()
+    finally:
+        con.close()
+
+
+def run_quality_file(cfg: Config, name: str) -> pd.DataFrame:
+    path = cfg.root / "sql" / "quality" / name
     con = connect(cfg, read_only=True)
     try:
         return con.execute(path.read_text()).df()
@@ -49,3 +60,7 @@ def query(cfg: Config, sql: str) -> pd.DataFrame:
 
 def all_analytics_files(cfg: Config) -> list[Path]:
     return sorted((cfg.root / "sql" / "analytics").glob("*.sql"))
+
+
+def all_quality_files(cfg: Config) -> list[Path]:
+    return sorted((cfg.root / "sql" / "quality").glob("*.sql"))

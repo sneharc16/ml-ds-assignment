@@ -12,6 +12,9 @@ generate-data-small:
 init-db:
 	$(PY) scripts/initialize_database.py
 
+sql-analytics:
+	$(PY) scripts/run_sql_analytics.py
+
 features:
 	$(PY) scripts/build_features.py
 
@@ -20,6 +23,12 @@ train:
 
 evaluate:
 	$(PY) scripts/evaluate_all_models.py
+
+monitor:
+	$(PY) scripts/run_monitoring.py
+
+quality-gate:
+	$(PY) scripts/check_model_quality.py
 
 pipeline:
 	$(PY) scripts/run_pipeline.py

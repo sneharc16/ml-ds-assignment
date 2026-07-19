@@ -1,0 +1,21 @@
+name: Container builds
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        dockerfile: [Dockerfile.api, Dockerfile.dashboard]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Build image
+        run: docker build --file "${{ matrix.dockerfile }}" --tag driveintent-check:latest .

@@ -4,3 +4,7 @@ __pycache__/
 .venv/
 notebooks/.ipynb_checkpoints/
 *.duckdb
+data/
+artifacts/
+.pytest_cache/
+.ruff_cache/

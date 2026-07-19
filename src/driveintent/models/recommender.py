@@ -119,7 +119,9 @@ class CollaborativeRecommender:
             als = AlternatingLeastSquares(factors=self.factors, regularization=self.reg,
                                           iterations=self.iters, random_state=self.seed,
                                           use_gpu=False)
-            als.fit(mat, show_progress=False)
+            from threadpoolctl import threadpool_limits
+            with threadpool_limits(limits=1, user_api="blas"):
+                als.fit(mat, show_progress=False)
             self.user_f = np.asarray(als.user_factors)
             self.item_f = np.asarray(als.item_factors)
         except Exception:  # deterministic fallback
@@ -176,16 +178,23 @@ class RecommenderBundle:
         return self
 
     def save(self) -> None:
-        joblib.dump(self, self.cfg.artifacts / "recommender" / "recommender_bundle.joblib")
+        from driveintent.models import registry
+        path = self.cfg.artifacts / "recommender" / "recommender_bundle.joblib"
+        joblib.dump(self, path)
+        registry.register_external_artifact(
+            self.cfg, "recommender/bundle", path,
+            extra={"algorithm": "content_plus_implicit_als", "version": "v1"})
 
     @staticmethod
     def load(cfg: Config) -> "RecommenderBundle":
+        from driveintent.models import registry
         from driveintent.models.registry import ModelArtifactNotFoundError
         path = cfg.artifacts / "recommender" / "recommender_bundle.joblib"
         if not path.exists():
             raise ModelArtifactNotFoundError(
                 f"Recommender bundle not found at {path}. "
                 "Run `python scripts/train_all_models.py --model recommender`.")
+        registry.verify_external_artifact(path, path.with_name(f"{path.stem}.metadata.json"))
         return joblib.load(path)
 
 

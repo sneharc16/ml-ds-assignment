@@ -38,6 +38,7 @@ RANK_FEATURES = [
     "inventory_age", "market_demand_index",
     "finance_available", "delivery_available", "model_popularity",
 ]
+BLEND_SCORE_COLUMNS = ["content_score", "collaborative_score", "session_score", "ranker_score"]
 
 
 def relevance_from_impression(row: pd.Series) -> int:
@@ -187,10 +188,17 @@ def train_ranker(cfg: Config) -> dict:
                             depth=p["depth"], loss_function="QueryRMSE",
                             random_seed=cfg.seed, verbose=False, allow_writing_files=False)
     ranker.fit(tr_pool, eval_set=va_pool)
-
-    metrics = evaluate_rankers(cfg, ranker, test_df)
-    registry.save_model(cfg, "ranking", "ranker", ranker, RANK_FEATURES, [],
-                        metrics=metrics.get("ranker", {}))
+    blend_weights, serving_strategy, validation_report = select_champion_on_validation(
+        cfg, ranker, val_df
+    )
+    bundle = {"model": ranker, "blend_weights": blend_weights,
+              "serving_strategy": serving_strategy, "features": RANK_FEATURES}
+    metrics = evaluate_rankers(cfg, ranker, test_df, blend_weights, serving_strategy)
+    metrics["validation_selection"] = validation_report
+    registry.save_model(cfg, "ranking", "ranker", bundle, RANK_FEATURES, [],
+                        metrics=metrics["deployed_champion"],
+                        extra={"blend_weights": blend_weights,
+                               "serving_strategy": serving_strategy})
     (cfg.artifacts / "metrics" / "ranking_metrics.json").write_text(
         json.dumps(metrics, indent=2, default=str))
     return metrics
@@ -245,12 +253,66 @@ def ranking_metrics_for_scores(df: pd.DataFrame, score_col: str,
         n_sessions=len(ndcg10))
 
 
-def evaluate_rankers(cfg: Config, ranker: CatBoostRanker, test_df: pd.DataFrame) -> dict:
+def _scored_frame(ranker: CatBoostRanker, frame: pd.DataFrame) -> pd.DataFrame:
+    pool, d = _rank_pool(frame.copy(), with_label=False, with_weight=False)
+    d["ranker_score"] = ranker.predict(pool)
+    return d
+
+
+def _group_z(d: pd.DataFrame, column: str) -> pd.Series:
+    if "session_id" not in d:
+        return _z(d[column])
+    grouped = d.groupby("session_id", sort=False)[column]
+    mean = grouped.transform("mean")
+    sd = grouped.transform("std").replace(0, np.nan)
+    return ((d[column] - mean) / sd).fillna(0.0)
+
+
+def relevance_blend_score(d: pd.DataFrame, weights: dict[str, float]) -> pd.Series:
+    score = pd.Series(0.0, index=d.index)
+    for column in BLEND_SCORE_COLUMNS:
+        score += float(weights.get(column, 0.0)) * _group_z(d, column)
+    return score
+
+
+def select_champion_on_validation(cfg: Config, ranker: CatBoostRanker,
+                                  val_df: pd.DataFrame) -> tuple[dict[str, float], str, dict]:
     cars = pd.read_parquet(cfg.raw_data / "cars.parquet")
-    d = test_df.copy()
-    pool, sorted_df = _rank_pool(d, with_label=False, with_weight=False)
-    sorted_df["ranker_score"] = ranker.predict(pool)
-    d = sorted_df
+    d = _scored_frame(ranker, val_df)
+    trials = int(cfg.get("models", "ranker", "blend_search_trials") or 256)
+    rng = np.random.default_rng(cfg.seed)
+    candidates = list(np.eye(len(BLEND_SCORE_COLUMNS)))
+    candidates.extend(rng.dirichlet(np.ones(len(BLEND_SCORE_COLUMNS)), size=trials))
+    best_weights, best_metrics = None, None
+    for candidate in candidates:
+        weights = dict(zip(BLEND_SCORE_COLUMNS, map(float, candidate)))
+        d["candidate_score"] = relevance_blend_score(d, weights)
+        metrics = ranking_metrics_for_scores(d, "candidate_score", cars)
+        key = (metrics["ndcg_at_10"], metrics["map_at_10"], metrics["recall_at_10"])
+        if best_metrics is None or key > (best_metrics["ndcg_at_10"],
+                                           best_metrics["map_at_10"],
+                                           best_metrics["recall_at_10"]):
+            best_weights, best_metrics = weights, metrics
+    assert best_weights is not None and best_metrics is not None
+    d["relevance_score"] = relevance_blend_score(d, best_weights)
+    raw_ranker = d["ranker_score"].copy()
+    d["ranker_score"] = d["relevance_score"]
+    d["mo_score"] = multi_objective_score(cfg, d)
+    mo_metrics = ranking_metrics_for_scores(d, "mo_score", cars)
+    d["ranker_score"] = raw_ranker
+    strategy = "multi_objective" if mo_metrics["ndcg_at_10"] > best_metrics["ndcg_at_10"] else "relevance_blend"
+    return best_weights, strategy, {
+        "basis": "maximum NDCG@10 on validation sessions", "blend_weights": best_weights,
+        "relevance_blend": best_metrics, "multi_objective": mo_metrics,
+        "serving_strategy": strategy, "search_trials": len(candidates),
+    }
+
+
+def evaluate_rankers(cfg: Config, ranker: CatBoostRanker, test_df: pd.DataFrame,
+                     blend_weights: dict[str, float] | None = None,
+                     serving_strategy: str = "multi_objective") -> dict:
+    cars = pd.read_parquet(cfg.raw_data / "cars.parquet")
+    d = _scored_frame(ranker, test_df)
     # Catalog popularity is fixed before the test interaction. Never derive a
     # baseline from test clicks, which would leak the labels being evaluated.
     d["popularity_score"] = d["model_popularity"].astype(float)
@@ -262,9 +324,18 @@ def evaluate_rankers(cfg: Config, ranker: CatBoostRanker, test_df: pd.DataFrame)
                       ("session_only", "session_score"), ("weighted_hybrid", "hybrid_score"),
                       ("ranker", "ranker_score")]:
         out[name] = ranking_metrics_for_scores(d, col, cars)
-    # multi-objective reranker on top of ranker score
+    blend_weights = blend_weights or {"ranker_score": 1.0}
+    d["relevance_score"] = relevance_blend_score(d, blend_weights)
+    out["validation_selected_blend"] = ranking_metrics_for_scores(d, "relevance_score", cars)
+    raw_ranker = d["ranker_score"].copy()
+    d["ranker_score"] = d["relevance_score"]
     d["mo_score"] = multi_objective_score(cfg, d)
     out["multi_objective_reranker"] = ranking_metrics_for_scores(d, "mo_score", cars)
+    d["ranker_score"] = raw_ranker
+    deployed_key = "multi_objective_reranker" if serving_strategy == "multi_objective" else "validation_selected_blend"
+    out["deployed_champion"] = dict(out[deployed_key])
+    out["deployed_champion"]["strategy"] = serving_strategy
+    out["deployed_champion"]["source_metrics"] = deployed_key
     return out
 
 
@@ -429,18 +500,29 @@ def recommend_for_user(cfg: Config, user_id: str, session_id: str | None = None,
     except Exception:
         cand["sellthrough_probability"] = np.nan
 
-    ranker, _ = registry.load_model(cfg, "ranking", "ranker")
+    ranker_bundle, _ = registry.load_model(cfg, "ranking", "ranker")
+    if isinstance(ranker_bundle, dict) and "model" in ranker_bundle:
+        ranker = ranker_bundle["model"]
+        blend_weights = ranker_bundle.get("blend_weights", {"ranker_score": 1.0})
+        serving_strategy = ranker_bundle.get("serving_strategy", "multi_objective")
+    else:
+        ranker, blend_weights, serving_strategy = ranker_bundle, {"ranker_score": 1.0}, "multi_objective"
     cand["ranker_score"] = ranker.predict(cand[RANK_FEATURES])
+    cand["relevance_score"] = relevance_blend_score(cand, blend_weights)
+    raw_ranker = cand["ranker_score"].copy()
+    cand["ranker_score"] = cand["relevance_score"]
     cand["mo_score"] = multi_objective_score(cfg, cand)
+    cand["ranker_score"] = raw_ranker
+    cand["serving_score"] = cand["mo_score"] if serving_strategy == "multi_objective" else cand["relevance_score"]
 
     lam = {"low": 0.9, "medium": 0.7, "high": 0.5}.get(
         diversity_level or "", entropy_adaptive_lambda(cfg, prof.session_entropy if prof else 0.7))
-    final = mmr_diversify(cand, "mo_score", bundle.content, k=limit, lam=lam)
+    final = mmr_diversify(cand, "serving_score", bundle.content, k=limit, lam=lam)
 
     recs = []
     for rank, (_, r) in enumerate(final.iterrows(), start=1):
         recs.append(dict(
-            car_id=r["car_id"], rank=rank, score=round(float(r["mo_score"]), 3),
+            car_id=r["car_id"], rank=rank, score=round(float(r["serving_score"]), 3),
             make=r["make"], model=r["model"], body_type=r["body_type"],
             transmission=r["transmission"], fuel_type=r["fuel_type"], city=r["city"],
             listed_price=float(r["listed_price"]),
@@ -461,7 +543,8 @@ def recommend_for_user(cfg: Config, user_id: str, session_id: str | None = None,
                       hard_constraints=prof.hard_constraints,
                       soft_preferences=prof.soft_preferences)
     return dict(user_id=user_id, session_id=session_id, intent_summary=intent,
-                model_version="ranker_v1", generated_at=datetime.now().isoformat(),
+                model_version="ranker_v1", serving_strategy=serving_strategy,
+                generated_at=datetime.now().isoformat(),
                 recommendation_id=str(uuid.uuid4()), recommendations=recs)
 
 
