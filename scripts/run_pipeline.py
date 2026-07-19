@@ -9,9 +9,12 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 STEPS = [
     (["generate_data.py"], "generate synthetic data"),
     (["initialize_database.py"], "initialize DuckDB"),
+    (["run_sql_analytics.py"], "execute and export SQL analytics"),
     (["build_features.py"], "build features"),
     (["train_all_models.py"], "train models"),
     (["evaluate_all_models.py"], "evaluate + reports"),
+    (["run_monitoring.py"], "generate monitoring reports"),
+    (["check_model_quality.py"], "enforce deployment quality gates"),
     (["smoke_test.py"], "smoke test"),
 ]
 

@@ -141,7 +141,7 @@ def build_booking_dataset(impressions: pd.DataFrame, sessions: pd.DataFrame,
                     .max().reset_index().sort_values(["user_id", "session_start"]))
     sess_book["prior_sessions"] = sess_book.groupby("user_id").cumcount()
     sess_book["prior_bookings"] = sess_book.groupby("user_id")["booked"].transform(
-        lambda values: values.shift(fill_value=0).cumsum()
+        lambda values: values.astype(int).shift(fill_value=0).cumsum()
     )
     imp = imp.merge(sess_book[["user_id", "session_sequence_number",
                                "prior_sessions", "prior_bookings"]],

@@ -19,7 +19,8 @@ def main() -> None:
     if "price" in todo:
         from driveintent.models import price
         m = price.train(cfg)
-        logging.info("price MAE=%.0f R2=%.3f", m["catboost"]["mae"], m["catboost"]["r2"])
+        champion = m["deployed_champion"]
+        logging.info("price champion MAE=%.0f R2=%.3f", champion["mae"], champion["r2"])
     if "booking" in todo:
         from driveintent.models import classifiers
         m = classifiers.train(cfg, "booking")
@@ -39,7 +40,7 @@ def main() -> None:
     if "ranker" in todo:
         from driveintent.models import ranking
         m = ranking.train_ranker(cfg)
-        logging.info("ranker NDCG@10=%.3f", m["ranker"]["ndcg_at_10"])
+        logging.info("ranking champion NDCG@10=%.3f", m["deployed_champion"]["ndcg_at_10"])
 
 if __name__ == "__main__":
     main()

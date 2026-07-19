@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field, model_validator
 from driveintent.config import Config, load_config
 from driveintent.models import classifiers
 from driveintent.models import price as price_model
-from driveintent.models.registry import ModelArtifactNotFoundError
+from driveintent.models.registry import ModelArtifactIntegrityError, ModelArtifactNotFoundError
 
 log = logging.getLogger("driveintent.api")
 
@@ -33,6 +33,8 @@ def _jsonable(obj):
         return int(obj)
     if isinstance(obj, np.bool_):
         return bool(obj)
+    if isinstance(obj, (pd.Timestamp, pd.Timedelta)):
+        return obj.isoformat()
     return obj
 STATE: dict[str, Any] = {}
 
@@ -50,14 +52,14 @@ async def lifespan(app: FastAPI):
         from driveintent.models.recommender import RecommenderBundle
         RecommenderBundle.load(cfg)
         STATE["models_loaded"] = True
-    except ModelArtifactNotFoundError as e:
-        log.warning("Model artifacts missing: %s", e)
+    except (ModelArtifactNotFoundError, ModelArtifactIntegrityError) as e:
+        log.warning("Model artifacts unavailable: %s", e)
         STATE["models_loaded"] = False
     yield
     STATE.clear()
 
 
-app = FastAPI(title="DriveIntent API", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="DriveIntent API", version="1.1.0", lifespan=lifespan)
 
 
 def _cfg() -> Config:
@@ -137,7 +139,7 @@ def health():
     return dict(status="healthy" if database_ready and models_ready else "degraded",
                 database="connected" if database_ready else "missing",
                 models_loaded=models_ready,
-                version="1.0.0")
+                version="1.1.0")
 
 
 def _price_features(cfg: Config, car: CarInput) -> dict[str, Any]:
@@ -170,7 +172,7 @@ def predict_price(car: CarInput):
     try:
         pred = price_model.predict(cfg, row)
         factors = price_model.explain(cfg, row, top_k=5)
-    except ModelArtifactNotFoundError as e:
+    except (ModelArtifactNotFoundError, ModelArtifactIntegrityError) as e:
         raise HTTPException(503, str(e))
     fair = pred["predicted_fair_price"]
     out = dict(pred)
@@ -203,7 +205,7 @@ def booking_probability(inp: BookingInput):
     try:
         p = float(classifiers.predict_proba(cfg, "booking", rows)[0])
         factors = classifiers.explain(cfg, "booking", rows, top_k=5)
-    except ModelArtifactNotFoundError as e:
+    except (ModelArtifactNotFoundError, ModelArtifactIntegrityError) as e:
         raise HTTPException(503, str(e))
     quality = "high" if p > 0.15 else "medium" if p > 0.05 else "low"
     action = {"high": "prioritize_callback", "medium": "standard_queue",
@@ -225,7 +227,7 @@ def sellthrough_probability(inp: SellthroughInput):
         rows = ds[ds["car_id"] == inp.car_id].head(1)
     try:
         p = float(classifiers.predict_proba(cfg, "sellthrough", rows)[0])
-    except ModelArtifactNotFoundError as e:
+    except (ModelArtifactNotFoundError, ModelArtifactIntegrityError) as e:
         raise HTTPException(503, str(e))
     return dict(car_id=inp.car_id, sellthrough_probability_30d=round(p, 4),
                 snapshot_age=int(rows["snapshot_age"].iloc[0]),
@@ -247,7 +249,7 @@ def recommendations(user_id: str, session_id: Optional[str] = None,
     try:
         out = recommend_for_user(cfg, user_id, session_id=session_id,
                                  limit=limit, diversity_level=diversity_level)
-    except ModelArtifactNotFoundError as e:
+    except (ModelArtifactNotFoundError, ModelArtifactIntegrityError) as e:
         raise HTTPException(503, str(e))
     if not include_explanations:
         for r in out["recommendations"]:
@@ -285,6 +287,49 @@ def campaign_perf():
     from driveintent.analytics.analytics import campaign_performance
     df = campaign_performance(_cfg())
     return _jsonable(dict(campaigns=df.to_dict(orient="records")))
+
+
+@app.get("/api/v1/monitoring/status")
+def monitoring_status():
+    path = _cfg().artifacts / "monitoring" / "status.json"
+    if not path.exists():
+        raise HTTPException(503, "monitoring status unavailable; run scripts/run_monitoring.py")
+    import json
+    return json.loads(path.read_text())
+
+
+@app.get("/api/v1/monitoring/drift")
+def monitoring_drift(severity: Optional[str] = Query(None, pattern="^(ok|warning|critical)$"),
+                     limit: int = Query(100, ge=1, le=500)):
+    path = _cfg().artifacts / "monitoring" / "drift_report.json"
+    if not path.exists():
+        raise HTTPException(503, "drift report unavailable; run scripts/run_monitoring.py")
+    import json
+    report = json.loads(path.read_text())
+    features = report["features"]
+    if severity:
+        features = [row for row in features if row["severity"] == severity]
+    return {"status": report["status"], "summary": report["summary"],
+            "count": len(features), "features": features[:limit]}
+
+
+SQL_INSIGHTS = {
+    "campaign_attribution", "campaign_quality", "cohort_retention", "customer_360",
+    "demand_supply_gap", "funnel_analysis", "funnel_transition_times", "inventory_aging",
+    "inventory_survival", "position_bias", "price_analysis", "recommendation_ips",
+    "recommendation_metrics", "user_intent_analysis",
+}
+
+
+@app.get("/api/v1/sql/insights/{query_name}")
+def sql_insight(query_name: str, limit: int = Query(100, ge=1, le=1000)):
+    """Serve only reviewed, repository-owned SQL—not arbitrary client SQL."""
+    if query_name not in SQL_INSIGHTS:
+        raise HTTPException(404, f"unknown insight; choose one of {sorted(SQL_INSIGHTS)}")
+    from driveintent.data.load_database import run_sql_file
+    frame = run_sql_file(_cfg(), f"{query_name}.sql")
+    return _jsonable({"query": query_name, "count": len(frame),
+                      "rows": frame.head(limit).to_dict(orient="records")})
 
 
 @app.post("/api/v1/campaigns/optimize-budget")

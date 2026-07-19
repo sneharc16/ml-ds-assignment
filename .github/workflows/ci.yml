@@ -31,3 +31,5 @@ jobs:
         run: python -m ruff check src scripts tests
       - name: Run tests
         run: python -m pytest -q
+      - name: Enforce model quality gates
+        run: python scripts/check_model_quality.py

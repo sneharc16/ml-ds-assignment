@@ -1,389 +1,175 @@
-# 🚗 DriveIntent — Intent-Aware Used-Car Marketplace Intelligence
+# DriveIntent
 
-DriveIntent is an end-to-end data-science / ML platform for a CARS24-style used-car
-marketplace. It generates a realistic **synthetic** Indian marketplace with latent
-buyer intent and position bias, then builds the full modelling stack a marketplace
-DS team would own: fair-price estimation with uncertainty, conversion and
-sell-through prediction, a hybrid intent-aware recommender with learning-to-rank and
-position-bias correction, multi-objective reranking, campaign lead-quality analytics
-with a budget optimizer, and an A/B-testing toolkit — all served behind a FastAPI
-service and a 5-page Streamlit dashboard.
+DriveIntent is a deployable ML, recommendation, and SQL intelligence platform
+for an Indian used-car marketplace. It was rebuilt as a CARS24-oriented
+assignment that connects four decisions in one reproducible system:
 
-> **Everything here is synthetic.** The numbers demonstrate *methodology*, not real
-> CARS24 performance. The data-generating process is deliberately transparent so that
-> every modelling choice can be checked against known ground truth.
+- fair-price regression with calibrated price intervals;
+- booking and 30-day sell-through classification;
+- hybrid candidate generation, learning-to-rank, and diverse recommendations;
+- GA4-style journey, campaign, customer, inventory, and recommender analytics.
 
----
+Every included customer, event, vehicle, and campaign is synthetic. No CARS24
+data, credentials, or proprietary code is used.
 
-## Table of contents
+## Verified results
 
-1. [Why this project](#1-why-this-project)
-2. [What it does](#2-what-it-does)
-3. [Architecture](#3-architecture)
-4. [Repository layout](#4-repository-layout)
-5. [Quickstart](#5-quickstart)
-6. [The synthetic data-generating process](#6-the-synthetic-data-generating-process)
-7. [Leakage & latent-variable discipline](#7-leakage--latent-variable-discipline)
-8. [Temporal validation](#8-temporal-validation)
-9. [Models](#9-models)
-10. [Position bias & IPW](#10-position-bias--ipw)
-11. [Multi-objective reranking](#11-multi-objective-reranking)
-12. [Intent inference](#12-intent-inference)
-13. [Campaign analytics & budget optimizer](#13-campaign-analytics--budget-optimizer)
-14. [A/B testing toolkit](#14-ab-testing-toolkit)
-15. [Results (small profile)](#15-results-small-profile)
-16. [API](#16-api)
-17. [Dashboard](#17-dashboard)
-18. [SQL analytics](#18-sql-analytics)
-19. [Testing](#19-testing)
-20. [Configuration](#20-configuration)
-21. [Docker](#21-docker)
-22. [Business insights](#22-business-insights)
-23. [Limitations & honest caveats](#23-limitations--honest-caveats)
-24. [Interview discussion points](#24-interview-discussion-points)
+These figures come from the deterministic small profile and temporal test
+window (`seed=42`). They are reproducible with `make pipeline-small`.
 
----
+| Decision | Deployed result | Reference |
+| --- | ---: | ---: |
+| Fair price | MAE ₹88,358; R² 0.8585 | Global-median MAE ₹241,485 |
+| Booking propensity | ROC-AUC 0.7401; PR-AUC 0.0981 | Base rate 0.0325; top-5% lift 4.50× |
+| 30-day sell-through | ROC-AUC 0.5544; PR-AUC 0.3471 | Base rate 0.2607; top-5% lift 1.92× |
+| Recommendation rank | NDCG@10 0.6282; Recall@10 0.8782 | Raw LTR NDCG@10 0.4651 |
 
-## 1. Why this project
+The price champion is a validation-selected convex ensemble (Extra Trees,
+CatBoost RMSE, and CatBoost MAE). The ranking champion is selected only on the
+validation window; on this dataset it correctly retains session intent rather
+than deploying the weaker raw ranker. This is deliberate model governance, not
+metric cherry-picking. All 11 configured deployment gates pass. See
+[`docs/VERIFIED_RESULTS.md`](docs/VERIFIED_RESULTS.md) for evaluation boundaries.
 
-Marketplace DS work is defined by two hard problems that generic ML tutorials skip:
-
-- **Feedback loops & bias.** What users click is a function of what the ranker showed
-  them, so naïve click models learn the ranker's old habits. DriveIntent bakes
-  position bias into the data and corrects for it with inverse-propensity weighting.
-- **Competing objectives.** A used-car platform must satisfy the buyer *and* move
-  aging inventory *and* respect unit economics. DriveIntent makes those trade-offs
-  explicit in a configurable multi-objective reranker rather than hiding them in a
-  single CTR model.
-
-Because the DGP is synthetic and known, we can prove the models recover real signal
-rather than fitting noise or leaking the answer.
-
-## 2. What it does
-
-- Generates cars, users, campaigns, sessions and GA4-style events with **latent**
-  fair prices, deal quality and session intent that drive behavior but are never
-  exposed as features.
-- Estimates a **fair price** (P50) plus a conformalized **P10–P90 interval** and
-  per-prediction SHAP explanations.
-- Predicts **booking probability** (lead quality) and **30-day sell-through**, both
-  probability-calibrated.
-- Serves **intent-aware recommendations** via a hybrid candidate generator
-  (content + collaborative + session + popularity + inventory), a CatBoost
-  learning-to-rank model with position-bias correction, and a multi-objective
-  reranker with MMR diversity.
-- Produces **campaign lead-quality** analytics, a **budget-allocation** simulation,
-  inventory opportunity detection, and an **A/B-test** design/simulation toolkit.
-- Exposes all of it through a **FastAPI** service and a **Streamlit** dashboard.
-
-## 3. Architecture
+## System architecture
 
 ```mermaid
 flowchart TD
-    subgraph Gen["Synthetic data generation"]
-        DGP["Latent DGP: fair price, deal, intent, position bias"]
-        DGP --> RAW["Raw parquet: cars, users, campaigns, sessions, events, impressions"]
-    end
-    RAW --> DB[("DuckDB warehouse")]
-    DB --> SQLA["SQL analytics: funnel, position bias, demand-supply, campaigns"]
-    RAW --> FEAT["Feature store: price / booking / sellthrough / ranking datasets"]
-    FEAT --> PRICE["Fair-price regression + quantiles + SHAP"]
-    FEAT --> BOOK["Booking classifier (calibrated)"]
-    FEAT --> SELL["Sell-through classifier (calibrated)"]
-    RAW --> REC["Hybrid recommender: content + ALS + session + popularity"]
-    REC --> RANK["CatBoost LTR + IPW position-bias correction"]
-    PRICE --> RERANK["Multi-objective reranker + MMR diversity"]
-    BOOK --> RERANK
-    RANK --> RERANK
-    REG[("Model registry")] -.-> API
-    PRICE --> REG
-    BOOK --> REG
-    SELL --> REG
-    RANK --> REG
-    REC --> REG
-    RERANK --> API["FastAPI service"]
-    SQLA --> DASH["Streamlit dashboard (5 pages)"]
-    API --> DASH
-    FEAT --> CAMP["Campaign analytics + budget optimizer + A/B toolkit"]
-    CAMP --> API
+  GA4[GA4 / flattened BigQuery events] --> ADAPTER[Canonical event adapter]
+  SYN[Synthetic marketplace generator] --> VALIDATE[Data contracts]
+  ADAPTER --> WH[(Parquet + DuckDB)]
+  VALIDATE --> WH
+  WH --> SQL[Semantic marts + 14 SQL analyses]
+  WH --> FS[Point-in-time feature datasets]
+  FS --> PRICE[Price ensemble + conformal intervals]
+  FS --> CLASS[Calibrated booking / sell-through]
+  FS --> REC[Content + ALS + session candidates]
+  PRICE --> RANK[Validation-selected ranking + MMR]
+  CLASS --> RANK
+  REC --> RANK
+  SQL --> API[FastAPI]
+  PRICE --> API
+  CLASS --> API
+  RANK --> API
+  API --> UI[Streamlit decision dashboard]
+  PRICE --> MON[Quality gates + drift]
+  CLASS --> MON
+  RANK --> MON
 ```
 
-## 4. Repository layout
+The design enforces temporal splits, point-in-time context, leakage bans,
+position-propensity weighting, validation-only champion selection, calibrated
+classification probabilities, conformal price intervals, and SHA-256 artifact
+and feature-contract verification.
 
-```
-driveintent/
-├── configs/config.yaml            # single source of truth (scale, splits, weights, params)
-├── sql/
-│   ├── ddl/create_tables.sql
-│   └── analytics/                 # 8 analytics queries (funnel, position bias, ...)
-├── src/driveintent/
-│   ├── config.py                  # Config dataclass, seeding, path resolution
-│   ├── data/
-│   │   ├── generate.py            # the latent DGP
-│   │   ├── validate.py            # schema + leakage guards
-│   │   └── load_database.py       # DuckDB init + query helpers
-│   ├── features/
-│   │   ├── intent.py              # intent inference (entropy, decay, constraints)
-│   │   └── build.py               # leak-free feature datasets
-│   ├── models/
-│   │   ├── common.py              # temporal split, metrics, calibration, bootstrap CI
-│   │   ├── registry.py            # versioned artifact registry + metadata
-│   │   ├── price.py               # regression + conformalized quantiles + SHAP
-│   │   ├── classifiers.py         # booking + sell-through (calibrated)
-│   │   ├── recommender.py         # content / ALS / session / candidate generation
-│   │   └── ranking.py             # LTR + IPW + multi-objective rerank + explanations
-│   ├── analytics/analytics.py     # campaigns, budget optimizer, inventory, A/B, ablation
-│   ├── api/main.py                # FastAPI service
-│   └── dashboard/                 # Streamlit app + 5 pages
-├── scripts/                       # generate / init-db / features / train / evaluate / pipeline / smoke
-├── tests/                         # pytest suite (34 tests)
-├── Makefile  Dockerfile.api  Dockerfile.dashboard  docker-compose.yml
-└── artifacts/                     # models, metrics, reports (generated)
-```
+## SQL expertise
 
-## 5. Quickstart
+SQL is executable application code here—not a folder of decorative snippets.
+The DuckDB layer contains:
+
+- typed raw table contracts;
+- session, car, and campaign-day semantic marts;
+- cohort retention with a date spine;
+- first-, last-, and linear-touch campaign attribution;
+- funnel transition-time quantiles;
+- inventory survival risk sets and cumulative survival;
+- customer-360 lifecycle and recency/value segmentation;
+- inverse-propensity recommendation evaluation;
+- anti-join and invariant-based data-quality checks.
+
+`scripts/run_sql_analytics.py` runs all 14 reviewed queries, exports their
+results and runtimes, and fails on warehouse violations. FastAPI exposes only an
+allowlist of repository-owned insights; clients cannot submit arbitrary SQL.
+Read [`docs/SQL_ANALYTICS.md`](docs/SQL_ANALYTICS.md).
+
+## Repository map
+
+| Path | Purpose |
+| --- | --- |
+| `src/driveintent/data` | Synthetic generation, validation, GA4 adapter, DuckDB loader |
+| `sql/ddl`, `sql/marts` | Warehouse contracts and reusable semantic views |
+| `sql/analytics`, `sql/quality` | Decision queries and executable data tests |
+| `src/driveintent/features` | Point-in-time features and intent profiles |
+| `src/driveintent/models` | Regression, classifiers, recommenders, ranker, registry |
+| `src/driveintent/monitoring` | PSI/JS drift and deployment quality gates |
+| `src/driveintent/api` | Pricing, conversion, recommendation, SQL, monitoring APIs |
+| `src/driveintent/dashboard` | Six-page Streamlit application |
+| `tests` | 71 data, SQL, model, API, serving, and deployment tests |
+| `render.yaml`, `Dockerfile.*` | Two-service deployment definition |
+
+## Open in VS Code
+
+Python 3.11 or 3.12 is supported. In the extracted project folder:
 
 ```bash
-# 1. install (editable, with dev extras)
-make install            # or: python3 -m pip install -e ".[dev]"
-
-# 2. run the whole pipeline on the fast "small" profile (~1 min)
-make pipeline-small     # data -> db -> features -> models -> reports -> smoke test
-
-#    ...or at full scale (documented profile)
-make pipeline
-
-# 3. serve
-make api                # FastAPI on http://localhost:8000  (/docs for Swagger)
-make dashboard          # Streamlit on http://localhost:8501
-
-# 4. quality gates
-make test               # pytest
-make smoke-test         # end-to-end health/pricing/recommendations check
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e ".[dev]"
+python scripts/run_pipeline.py --small
 ```
 
-Every step is also a standalone script under `scripts/` (e.g.
-`python scripts/train_all_models.py --model price`).
+On Windows PowerShell, activate with `.venv\Scripts\Activate.ps1`. Then open the
+folder in VS Code and choose the `.venv` interpreter. Repository settings enable
+pytest discovery automatically.
 
-## 6. The synthetic data-generating process
+Useful commands:
 
-The DGP (`data/generate.py`) is the heart of the project. Highlights:
+```bash
+make sql-analytics    # execute and export the SQL portfolio
+make quality-gate     # enforce the 11 model gates
+make test             # secret scan plus 71 tests
+make api              # http://localhost:8000/docs
+make dashboard        # http://localhost:8501
+```
 
-- **Catalog:** 34 models across 14 makes, each with body type, fuel options,
-  transmission, base price and a popularity prior. 12 Indian cities with
-  price multipliers and body/fuel demand skews.
-- **Fair price** is a log-linear latent: exponential depreciation (retention rises
-  with model popularity), kilometre penalty, condition/quality effects, accident and
-  owner penalties, automatic premium, city- and body-conditional diesel effects, plus
-  a premium-segment variance term. `listed_price` is the latent fair price perturbed
-  by seller noise; `transaction_price` applies a negotiation discount.
-- **Sale timing** follows a hazard `~0.011·exp(2.5·deal_latent)`: better deals sell
-  faster, producing realistic inventory aging.
-- **Sessions & events** follow a GA4-style funnel with **session intent drift**
-  (explore-by-body / transmission / budget / brand, or campaign-driven). Clicks follow
-  `sigmoid(-1.9 + 0.75·relevance_z + 0.5·(intent_boost − 1))` and are gated by an
-  **examination propensity** that decays with list position — this is the position bias
-  the ranker must later undo. Bookings depend on deep engagement, urgency, deal quality
-  and price mismatch.
+The full synthetic profile is available through `make pipeline`; start with the
+small profile to confirm the environment.
 
-Validation (`data/validate.py`) checks schemas, referential integrity, chronological
-session sequences, impression funnels, unique purchases, and purchase/inventory-date
-agreement. It also rejects forbidden outcome and latent columns in model feature lists.
+## GA4 import contract
 
-## 7. Leakage & latent-variable discipline
+Export a flattened GA4/BigQuery result to CSV or Parquet, then run:
 
-The variables that *generate* behavior — `latent_fair_price`, `deal_latent`, session
-intents — are stored separately (`data/raw/_latents_*.parquet`) and are **never**
-model features. `FORBIDDEN_FEATURES` in `validate.py` plus `validate_feature_list()`
-enforce this, and `tests/test_features.py::test_no_leakage_in_feature_lists` fails the
-build if a leaky column sneaks into any feature list. Price, booking, sell-through, and ranking rows use only information available at
-their observation timestamp. Market demand and live supply are computed as-of that
-time; booking counters stop at the recommendation decision; ranking profiles exclude
-future and label-session outcomes.
+```bash
+python scripts/import_ga4.py path/to/ga4_export.parquet \
+  --output-dir data/ga4_canonical --unknown-events error
+```
 
-## 8. Temporal validation
+Required input columns are `event_timestamp`, `event_name`,
+`user_pseudo_id`, and `ga_session_id`. Optional mappings cover item IDs/list
+positions, source/medium/campaign, engagement milliseconds, device, geography,
+page location, search, and filters. Unknown taxonomy can fail closed or be
+dropped explicitly.
 
-All splits are **temporal**, never random: train ≤ 2025-06-30, validation ≤
-2025-09-30, test ≤ 2025-12-31. Calibrators and decision thresholds are fit on the
-**validation** window only; the test window is touched exactly once, for reporting.
-This mirrors how a marketplace model is actually deployed against future traffic.
+## API and deployment
 
-## 9. Models
+After the pipeline finishes:
 
-| Task | Model | Comparison baselines | Calibration |
-|------|-------|----------------------|-------------|
-| Fair price (P50) | CatBoost RMSE | global median, make-model median, Ridge | — |
-| Price interval | CatBoost quantiles (α=.1/.5/.9) + **conformal** width | — | conformalized on val |
-| Booking (lead quality) | CatBoost (class-weighted) | prevalence, logistic regression | isotonic / Platt |
-| Sell-through (30d) | CatBoost (class-weighted) | prevalence, logistic regression | isotonic / Platt |
-| Ranking | CatBoost LTR (QueryRMSE, IPW) | popularity, content, collab, session, hybrid | — |
+```bash
+uvicorn driveintent.api.main:app --host 0.0.0.0 --port 8000
+streamlit run src/driveintent/dashboard/app.py --server.port 8501
+```
 
-A single library (CatBoost) is used for every supervised model, with CatBoost's
-**native SHAP** (`get_feature_importance(type="ShapValues")`) for explanations, so the
-stack stays consistent and dependency-light. Collaborative filtering uses `implicit`
-ALS with a deterministic TruncatedSVD fallback.
+The API health endpoint stays degraded until the database and every verified
+artifact are present. Pricing, conversion, recommendations, monitoring, and
+allowlisted SQL insights are documented at `/docs`.
 
-## 10. Position bias & IPW
+For containers:
 
-Because clicks are contaminated by examination bias, the ranking labels are corrected
-with **inverse-propensity weights** `w = min(1/propensity(position), w_max)`, clipped
-to avoid variance blow-up at deep positions. The propensity curve is exactly the one
-used during generation, so the correction is checkable. Propensity is used only for
-training weights; logging position is not a ranker input or serving feature. Offline evaluation compares
-popularity / content / collaborative / session / weighted-hybrid / LTR / reranked
-strategies on NDCG@5/10, MAP@10, Recall@5/10, HitRate, MRR, Coverage@10 and brand
-concentration.
+```bash
+docker compose up --build
+```
 
-## 11. Multi-objective reranking
+For a GitHub-connected Render deployment, use `render.yaml`. The explicit
+`DRIVEINTENT_BOOTSTRAP_DEMO=1` switch creates deterministic demo assets in an
+empty runtime; serving otherwise fails closed. Read [`DEPLOYMENT.md`](DEPLOYMENT.md)
+and [`docs/CARS24_SYSTEM_DESIGN.md`](docs/CARS24_SYSTEM_DESIGN.md).
 
-The reranker (`ranking.multi_objective_score`) blends configurable, normalized
-objectives: ranker relevance, booking probability, deal score, inventory-aging
-priority (gated on a relevance floor and quality floor so we never push bad cars),
-inspection quality, a hard-constraint penalty and an exposure-fairness penalty.
-**MMR diversity** then trades relevance against catalog similarity, with an
-**entropy-adaptive λ**: exploratory sessions (high intent entropy) get more diversity,
-decided sessions get more exploitation. All weights live in `configs/config.yaml`.
+## Scope and responsible use
 
-## 12. Intent inference
+This is a portfolio-grade reference implementation. Its synthetic accuracy is
+not evidence of real-market performance. Real deployment requires warehouse and
+event contracts, privacy/consent controls, randomized recommendation exploration,
+segment/fairness review, persistent model storage, latency SLOs, canaries,
+human-reviewed pricing policy, and online A/B tests.
 
-`features/intent.py` builds a per-user preference profile from event streams:
-event-type weights, exponential **recency decay** (with a short session half-life for
-current-session intent), normalized categorical distributions per dimension,
-**entropy** as an exploration signal, inferred **hard constraints** (e.g. budget
-ceilings, transmission) vs **soft preferences**, and a confidence score. This profile
-drives candidate generation, reranking diversity and the recommendation explanations.
-
-## 13. Campaign analytics & budget optimizer
-
-Campaign lead quality is scored as
-`expected_lead_value = P(booking) · P(purchase | booking) · contribution_margin`,
-rolled up to expected ROAS and an inventory-match score (can current stock satisfy the
-demand a campaign creates?). The **budget optimizer** allocates spend across campaigns
-on fitted log diminishing-return curves (`a·log(1 + b·x)`) via SLSQP under a total-
-budget constraint and per-campaign bounds. It is explicitly a **scenario simulation**,
-not a production bidding system.
-
-## 14. A/B testing toolkit
-
-Two-proportion **sample-size** calculation (α, power, MDE), plus a simulated
-user-randomized experiment returning lift, 95% CI, p-value and approximate attained
-power under the alternative distribution. The toolkit is opinionated about **randomization unit** (user, not session, to
-avoid the same user seeing both rankings) and about separating statistical from
-practical significance.
-
-## 15. Results and reproducibility
-
-Metrics are generated artifacts, not fixed claims in this README. Run `make
-pipeline-small` for the CI-scale profile or `make pipeline` for the documented full
-profile, then inspect:
-
-- `artifacts/metrics/*_metrics.json` for model metrics;
-- `artifacts/metrics/ranking_metrics.json` for honest temporal ranking comparisons;
-- `artifacts/reports/ablation_results.csv` for signal ablations;
-- `artifacts/reports/model_comparison.csv` for the model inventory.
-
-This avoids presenting stale results after changes to the DGP, temporal safeguards,
-feature contracts, or evaluation methodology. Small-profile numbers are useful for
-reproducibility and integration testing, not real-market performance claims.
-
-## 16. API
-
-`uvicorn driveintent.api.main:app` (or `make api`). Endpoints:
-
-| Method | Path | Purpose |
-|--------|------|---------|
-| GET | `/health` | liveness + model-load status |
-| POST | `/api/v1/pricing/predict` | fair price, interval, deal label, SHAP factors |
-| POST | `/api/v1/conversion/booking-probability` | calibrated lead quality + action |
-| POST | `/api/v1/conversion/sellthrough-probability` | 30-day sell-through |
-| GET | `/api/v1/recommendations/{user_id}` | ranked, reranked, explained recs |
-| GET | `/api/v1/recommendations/{user_id}/intent` | inferred intent profile |
-| GET | `/api/v1/inventory/opportunities` | demand-supply acquisition gaps |
-| GET | `/api/v1/campaigns/performance` | lead quality & ROAS |
-| POST | `/api/v1/campaigns/optimize-budget` | budget-allocation simulation |
-
-Models are eagerly loaded from the registry at startup; missing artifacts degrade to a
-clear 503 with a "run the pipeline" message rather than crashing. Interactive docs at
-`/docs`.
-
-## 17. Dashboard
-
-Five Streamlit pages (`make dashboard`): **Buyer Experience** (live intent + recs),
-**Price Intelligence** (interval + SHAP + comparables), **Inventory Intelligence**
-(aging, gaps, price-review candidates, sell-through distribution), **Marketing
-Intelligence** (lead quality, budget simulator, A/B designer) and **Model Monitoring**
-(regression/classification/ranking metrics, reliability diagrams, lift, ablation, data
-health).
-
-## 18. SQL analytics
-
-Eight DuckDB queries under `sql/analytics/` power the warehouse-side analysis: funnel,
-campaign quality, inventory aging, demand-supply gap, price analysis, position bias,
-user-intent analysis and recommendation metrics. Every file is executed by
-`tests/test_sql_queries.py`.
-
-## 19. Testing
-
-Pytest covers deterministic data generation, relational validation, point-in-time
-features, models and artifacts, recommender behavior, ranking math and leakage guards,
-SQL, analytics/experiment calculations, and API request integrity. A session-scoped
-fixture runs the small pipeline once and shares it across tests. GitHub Actions installs
-the project, runs Ruff, and executes the full suite on pull requests and pushes to
-`main`; secret scanning runs as a separate required check.
-
-## 20. Configuration
-
-`configs/config.yaml` is the single source of truth: data scale (full + small
-profiles), temporal split dates, the position-bias propensity curve, recommendation
-top-k sizes, all reranking weights and MMR λ values, and every model's
-hyperparameters. Seed is fixed (42) throughout.
-
-## 21. Docker
-
-Run `make pipeline-small` (or `make pipeline`) first, then `docker compose up
---build`. Compose starts the API (8000) and dashboard (8501), mounting `data/` and
-`artifacts/` so the host-generated database and model artifacts are served by both
-containers.
-
-## 22. Business insights
-
-- **Traffic ≠ conversions.** The campaign analytics separate volume from lead quality;
-  the highest-traffic channel is rarely the highest expected-ROAS channel.
-- **Position bias is large.** Top-slot CTR is ~3× the tenth slot regardless of
-  relevance; uncorrected click models would over-reward whatever the old ranker
-  promoted.
-- **Inventory aging is a deal-quality signal.** Cars that linger are disproportionately
-  mispriced; the price-review report surfaces high-engagement / zero-booking cars as
-  concrete pricing actions.
-- **Diversity should be intent-adaptive.** Forcing diversity on decided buyers hurts;
-  withholding it from explorers hurts. Entropy-adaptive λ handles both.
-
-## 23. Limitations & honest caveats
-
-- **Synthetic data.** All results demonstrate methodology; they are not CARS24
-  performance. Model quality is bounded by how faithfully the DGP mimics reality.
-- **Small-profile results are modest and noisy.** They are intended for integration
-  testing, not performance claims. Re-run the pipeline after code or DGP changes and
-  use the generated metric artifacts rather than copied historical numbers.
-- **Sell-through is the weakest model** (ROC ≈ 0.57 small-profile): 30-day sale is
-  largely driven by the latent deal quality we deliberately withhold, so the observable
-  features leave real irreducible error — an honest ceiling, not a bug.
-- **The budget optimizer is a simulation** on assumed log response curves, not a live
-  bidding system; real curves need experimentation to fit.
-- **IPW uses the true propensities.** In production these must be *estimated* (e.g.
-  randomized position swaps / RandPair), which adds variance the offline numbers hide.
-- **Cold-start** falls back to city-segment popularity; a production system would add
-  richer content priors and onboarding signals.
-
-## 24. Interview discussion points
-
-- How the DGP lets us *prove* the ranker recovers relevance rather than memorizing
-  position, and how we'd estimate propensities without a known curve.
-- Why calibration and thresholds are fit on validation, and how lead-quality bands map
-  to concrete sales-ops actions.
-- The relevance-gated inventory boost: moving aging stock **without** degrading buyer
-  experience, and how the weights would be tuned via online experiments.
-- Choosing user-level randomization and separating statistical from practical
-  significance in the A/B toolkit.
-- What breaks first at 100× scale (ALS retraining cadence, candidate-generation
-  latency, propensity estimation variance) and how to stage the migration.
+See [`SECURITY.md`](SECURITY.md) and [`LICENSE`](LICENSE).

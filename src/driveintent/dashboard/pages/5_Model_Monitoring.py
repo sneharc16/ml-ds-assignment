@@ -1,4 +1,6 @@
-"""Model Monitoring: metrics, calibration, lift, ranking, data health."""
+"""Model Monitoring: performance, deployment gates, and feature drift."""
+import json
+
 import pandas as pd
 import plotly.express as px
 import streamlit as st
@@ -9,13 +11,13 @@ st.set_page_config(page_title="Model Monitoring", layout="wide")
 st.title("📈 Model Monitoring")
 cfg = load_cfg()
 
-tab_r, tab_c, tab_k, tab_d = st.tabs(
-    ["Regression", "Classification", "Recommendations", "Data health"])
+tab_r, tab_c, tab_k, tab_p, tab_d = st.tabs(
+    ["Regression", "Classification", "Recommendations", "Production", "Data health"])
 
 with tab_r:
     m = metrics_json("price_metrics.json")
     if m:
-        cb = m["catboost"]
+        cb = m.get("deployed_champion", m["catboost"])
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("MAE", f"₹{cb['mae']:,.0f}")
         c2.metric("RMSE", f"₹{cb['rmse']:,.0f}")
@@ -69,7 +71,7 @@ with tab_k:
     if m:
         rows = [{"model": k, **{kk: round(vv, 4) for kk, vv in v.items()
                                 if isinstance(vv, (int, float))}}
-                for k, v in m.items() if isinstance(v, dict)]
+                for k, v in m.items() if isinstance(v, dict) and "ndcg_at_10" in v]
         df = pd.DataFrame(rows)
         st.dataframe(df[["model", "ndcg_at_5", "ndcg_at_10", "map_at_10",
                          "recall_at_10", "mrr", "coverage_at_10",
@@ -81,6 +83,32 @@ with tab_k:
     if ab.exists():
         st.subheader("Ablation study")
         st.dataframe(pd.read_csv(ab), use_container_width=True)
+
+with tab_p:
+    status_path = cfg.artifacts / "monitoring" / "status.json"
+    drift_path = cfg.artifacts / "monitoring" / "drift_report.json"
+    gates_path = cfg.artifacts / "monitoring" / "quality_gates.json"
+    if not status_path.exists():
+        st.warning("Run `python scripts/run_monitoring.py` to generate production reports.")
+    else:
+        status = json.loads(status_path.read_text())
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Deployment ready", "YES" if status["deployment_ready"] else "NO")
+        c2.metric("Quality gates", f"{status['quality_gates']['passed']}/{status['quality_gates']['total']}")
+        c3.metric("Drift status", status["drift"]["status"].upper())
+        if gates_path.exists():
+            st.subheader("Quality gates")
+            st.dataframe(pd.DataFrame(json.loads(gates_path.read_text())["checks"]),
+                         use_container_width=True)
+        if drift_path.exists():
+            drift = json.loads(drift_path.read_text())
+            features = pd.DataFrame(drift["features"])
+            st.subheader("Feature drift")
+            severity = st.multiselect("Severity", ["critical", "warning", "ok"],
+                                      default=["critical", "warning"])
+            shown = features[features["severity"].isin(severity)]
+            st.dataframe(shown.sort_values(["severity", "value"], ascending=[True, False]),
+                         use_container_width=True)
 
 with tab_d:
     for t in ("cars", "users", "sessions", "events"):

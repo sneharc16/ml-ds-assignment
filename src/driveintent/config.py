@@ -76,7 +76,7 @@ class Config:
             self.path(key).mkdir(parents=True, exist_ok=True)
         self.database.parent.mkdir(parents=True, exist_ok=True)
         for sub in ("regression", "classification", "recommender", "ranking",
-                    "encoders", "metrics", "reports"):
+                    "encoders", "metrics", "reports", "monitoring"):
             (self.artifacts / sub).mkdir(parents=True, exist_ok=True)
 
 

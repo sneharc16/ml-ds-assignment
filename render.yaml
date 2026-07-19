@@ -1,0 +1,31 @@
+services:
+  - type: web
+    name: driveintent-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile.api
+    healthCheckPath: /health
+    autoDeployTrigger: checksPass
+    envVars:
+      - key: DRIVEINTENT_BOOTSTRAP_DEMO
+        value: "1"
+      - key: OMP_NUM_THREADS
+        value: "1"
+      - key: OPENBLAS_NUM_THREADS
+        value: "1"
+      - key: MKL_NUM_THREADS
+        value: "1"
+  - type: web
+    name: driveintent-dashboard
+    runtime: docker
+    dockerfilePath: ./Dockerfile.dashboard
+    healthCheckPath: /_stcore/health
+    autoDeployTrigger: checksPass
+    envVars:
+      - key: DRIVEINTENT_BOOTSTRAP_DEMO
+        value: "1"
+      - key: OMP_NUM_THREADS
+        value: "1"
+      - key: OPENBLAS_NUM_THREADS
+        value: "1"
+      - key: MKL_NUM_THREADS
+        value: "1"

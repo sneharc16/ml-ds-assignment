@@ -37,4 +37,6 @@ def pipeline(cfg, tables):
     events_train = events[pd.to_datetime(events["event_timestamp"]) < train_end]
     RecommenderBundle(cfg).fit(cars, events_train).save()
     ranking.train_ranker(cfg)
+    from driveintent.monitoring.monitor import run_monitoring
+    run_monitoring(cfg)
     return cfg

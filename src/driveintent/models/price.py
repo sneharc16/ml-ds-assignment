@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 from catboost import CatBoostRegressor, Pool
 from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import ExtraTreesRegressor
 from sklearn.linear_model import Ridge
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
@@ -28,6 +29,51 @@ def _pool(df: pd.DataFrame, with_label: bool = True) -> Pool:
     for c in PRICE_CAT:
         X[c] = X[c].astype(str)
     return Pool(X, label=df["target_price"] if with_label else None, cat_features=PRICE_CAT)
+
+
+def _sklearn_frame(df: pd.DataFrame) -> pd.DataFrame:
+    X = df[PRICE_FEATURES].copy()
+    for c in PRICE_CAT:
+        X[c] = X[c].fillna("UNKNOWN").astype(str)
+    for c in NUM_FEATURES:
+        X[c] = pd.to_numeric(X[c], errors="coerce").fillna(0.0)
+    return X
+
+
+def _predict_point_candidates(models: dict, df: pd.DataFrame) -> dict[str, np.ndarray]:
+    pool = _pool(df, with_label=False)
+    X = _sklearn_frame(df)
+    return {
+        name: np.asarray(model.predict(pool if name.startswith("catboost_") else X), dtype=float)
+        for name, model in models.items()
+    }
+
+
+def _select_simplex_blend(y: np.ndarray, predictions: dict[str, np.ndarray],
+                          step: float) -> tuple[dict[str, float], dict[str, float]]:
+    names = list(predictions)
+    if len(names) != 3:
+        raise ValueError("price champion search requires exactly three candidates")
+    units = max(int(round(1.0 / step)), 1)
+    best: tuple[float, float, tuple[int, int, int]] | None = None
+    for i in range(units + 1):
+        for j in range(units - i + 1):
+            k = units - i - j
+            weights = (i / units, j / units, k / units)
+            pred = sum(w * predictions[name] for w, name in zip(weights, names))
+            metrics = regression_metrics(y, pred)
+            objective = (metrics["mae"], metrics["rmse"], (i, j, k))
+            if best is None or objective[:2] < best[:2]:
+                best = objective
+    assert best is not None
+    chosen = {name: count / units for name, count in zip(names, best[2])}
+    pred = sum(chosen[name] * predictions[name] for name in names)
+    return chosen, regression_metrics(y, pred)
+
+
+def _blended_point_prediction(bundle: dict, df: pd.DataFrame) -> np.ndarray:
+    predictions = _predict_point_candidates(bundle["point_candidates"], df)
+    return sum(bundle["point_weights"][name] * pred for name, pred in predictions.items())
 
 
 def train(cfg: Config) -> dict:
@@ -60,19 +106,54 @@ def train(cfg: Config) -> dict:
     ridge.fit(Xtr, y_tr)
     results["baseline_ridge"] = regression_metrics(y_te, ridge.predict(Xte))
 
-    # main model: CatBoost
-    p = cfg.get("models", "price", "catboost")
-    cb = CatBoostRegressor(iterations=p["iterations"], learning_rate=p["learning_rate"],
-                           depth=p["depth"], loss_function="RMSE",
-                           random_seed=cfg.seed, verbose=False, allow_writing_files=False,
-                           early_stopping_rounds=40)
-    cb.fit(_pool(train_df), eval_set=_pool(val_df))
-    pred_te = cb.predict(_pool(test_df, with_label=False))
+    candidate_cfg = cfg.get("models", "price", "point_candidates")
+    models: dict[str, object] = {}
+    extra_cfg = candidate_cfg["extra_trees"]
+    pre_extra = ColumnTransformer([
+        ("num", StandardScaler(), NUM_FEATURES),
+        ("cat", OneHotEncoder(handle_unknown="ignore", max_categories=40,
+                              sparse_output=False), PRICE_CAT),
+    ])
+    extra = Pipeline([
+        ("pre", pre_extra),
+        ("model", ExtraTreesRegressor(
+            n_estimators=extra_cfg["n_estimators"],
+            min_samples_leaf=extra_cfg["min_samples_leaf"],
+            max_features=extra_cfg["max_features"], random_state=cfg.seed, n_jobs=1,
+        )),
+    ])
+    extra.fit(_sklearn_frame(train_df), y_tr)
+    models["extra_trees"] = extra
+    for name in ("catboost_rmse", "catboost_mae"):
+        cp = candidate_cfg[name]
+        model = CatBoostRegressor(
+            iterations=cp["iterations"], learning_rate=cp["learning_rate"],
+            depth=cp["depth"], loss_function=cp["loss_function"],
+            random_seed=cfg.seed, verbose=False, allow_writing_files=False,
+            early_stopping_rounds=60,
+        )
+        model.fit(_pool(train_df), eval_set=_pool(val_df))
+        models[name] = model
+    val_predictions = _predict_point_candidates(models, val_df)
+    selection_cfg = cfg.get("models", "price", "champion_selection")
+    point_weights, validation_metrics = _select_simplex_blend(
+        y_va, val_predictions, float(selection_cfg["simplex_step"])
+    )
+    test_predictions = _predict_point_candidates(models, test_df)
+    pred_te = sum(point_weights[name] * pred for name, pred in test_predictions.items())
     m = regression_metrics(y_te, pred_te)
+    results["candidate_models"] = {
+        name: regression_metrics(y_te, pred) for name, pred in test_predictions.items()
+    }
+    results["validation_selection"] = {
+        "basis": "minimum MAE on validation window", "weights": point_weights,
+        "metrics": validation_metrics,
+    }
 
     # quantiles
     qmodels = {}
     qpreds = {}
+    p = cfg.get("models", "price", "catboost")
     for q in cfg.get("models", "price", "quantiles"):
         qm = CatBoostRegressor(iterations=p["iterations"], learning_rate=p["learning_rate"],
                                depth=p["depth"], loss_function=f"Quantile:alpha={q}",
@@ -98,7 +179,9 @@ def train(cfg: Config) -> dict:
     lo = np.maximum(lo, 0.0)
     m.update(interval_metrics(y_te, lo, hi))
     m["conformal_delta"] = conformal_delta
-    results["catboost"] = m
+    results["catboost"] = results["candidate_models"]["catboost_rmse"]
+    results["validation_selected_ensemble"] = m
+    results["deployed_champion"] = m
     results["interval_coverage_target"] = target
 
     # error slices
@@ -110,10 +193,15 @@ def train(cfg: Config) -> dict:
         slices[f"mae_by_{dim}"] = s.round(0).to_dict()
     results["slices"] = slices
 
-    bundle = dict(point=cb, quantiles=qmodels, features=PRICE_FEATURES,
+    bundle = dict(point=models["catboost_rmse"], point_candidates=models,
+                  point_weights=point_weights,
+                  point_strategy="validation_selected_convex_ensemble",
+                  quantiles=qmodels, features=PRICE_FEATURES,
                   cat_features=PRICE_CAT, conformal_delta=conformal_delta)
     registry.save_model(cfg, "regression", "price", bundle,
-                        PRICE_FEATURES, PRICE_CAT, metrics=results["catboost"])
+                        PRICE_FEATURES, PRICE_CAT, metrics=results["deployed_champion"],
+                        extra={"point_strategy": bundle["point_strategy"],
+                               "point_weights": point_weights})
     (cfg.artifacts / "metrics" / "price_metrics.json").write_text(
         json.dumps(results, indent=2, default=str))
 
@@ -134,7 +222,11 @@ def predict(cfg: Config, car_row: dict | pd.DataFrame) -> dict:
     df["target_price"] = 0.0
     pool = _pool(df, with_label=False)
     delta = float(bundle.get("conformal_delta", 0.0))
-    p50 = float(bundle["point"].predict(pool)[0]) if len(df) == 1 else bundle["point"].predict(pool)
+    if "point_candidates" in bundle:
+        point = _blended_point_prediction(bundle, df)
+    else:
+        point = np.asarray(bundle["point"].predict(pool), dtype=float)
+    p50 = float(point[0]) if len(df) == 1 else point
     q10 = bundle["quantiles"]["q10"].predict(pool) - delta
     q90 = bundle["quantiles"]["q90"].predict(pool) + delta
     if isinstance(p50, float):

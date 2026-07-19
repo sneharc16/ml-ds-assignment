@@ -1,6 +1,6 @@
 project:
   name: DriveIntent
-  version: "1.0.0"
+  version: "1.1.0"
   random_seed: 42
 
 paths:
@@ -72,6 +72,24 @@ models:
       iterations: 400
       learning_rate: 0.08
       depth: 7
+    champion_selection:
+      simplex_step: 0.05
+      objective: mae
+    point_candidates:
+      extra_trees:
+        n_estimators: 500
+        min_samples_leaf: 2
+        max_features: 0.8
+      catboost_rmse:
+        iterations: 700
+        learning_rate: 0.04
+        depth: 4
+        loss_function: RMSE
+      catboost_mae:
+        iterations: 700
+        learning_rate: 0.04
+        depth: 5
+        loss_function: MAE
     quantiles: [0.1, 0.5, 0.9]
     interval_coverage: 0.80
   booking:
@@ -93,6 +111,32 @@ models:
     iterations: 300
     learning_rate: 0.08
     depth: 6
+    blend_search_trials: 256
+
+monitoring:
+  psi_warning: 0.10
+  psi_critical: 0.25
+  js_warning: 0.10
+  js_critical: 0.20
+  missing_rate_delta_warning: 0.05
+  missing_rate_delta_critical: 0.15
+
+quality_gates:
+  price:
+    minimum_r2: 0.75
+    maximum_mae: 180000
+    maximum_global_median_mae_ratio: 0.70
+  booking:
+    minimum_roc_auc: 0.65
+    minimum_pr_auc_lift: 1.50
+    minimum_top5_lift: 1.50
+  sellthrough:
+    minimum_roc_auc: 0.50
+    minimum_pr_auc_lift: 1.05
+    minimum_top5_lift: 1.00
+  ranking:
+    minimum_ndcg_at_10: 0.50
+    maximum_session_baseline_degradation: 0.02
 
 api:
   host: 0.0.0.0
